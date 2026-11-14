@@ -1,0 +1,11 @@
+astronaut_id,timestamp,indicator,value,unit,source
+AST001,2026-11-14T08:00:00,heart_rate,72,bpm,wearable
+AST001,2026-11-14T08:00:00,spo2,98,percent,wearable
+AST001,2026-11-14T08:00:00,temperature,36.8,C,sensor
+AST001,2026-11-14T08:00:00,sleep_duration,7.2,hours,self_report
+AST001,2026-11-14T08:00:00,fatigue,2,score,self_report
+AST001,2026-11-14T12:00:00,heart_rate,74,bpm,wearable
+AST001,2026-11-14T12:00:00,spo2,98,percent,wearable
+AST001,2026-11-14T12:00:00,temperature,36.9,C,sensor
+AST001,2026-11-14T12:00:00,sleep_duration,7.2,hours,self_report
+AST001,2026-11-14T12:00:00,fatigue,2,score,self_report

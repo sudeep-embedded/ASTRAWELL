@@ -1,0 +1,16 @@
+project:
+  name: ASTRAWELL
+  mode: offline_first
+  demo_data: true
+
+indicators:
+  heart_rate:
+    unit: bpm
+  spo2:
+    unit: percent
+  temperature:
+    unit: C
+  sleep_duration:
+    unit: hours
+  fatigue:
+    unit: score
