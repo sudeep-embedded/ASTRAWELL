@@ -389,7 +389,12 @@ def src_clause(source):
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def list_astronauts() -> list[str]:
+def list_astronauts(source: str = "all") -> list[str]:
+    if source == "simulated":
+        return CREW.copy()
+    if source == "csv_import":
+        return read_df("SELECT DISTINCT astronaut_id FROM telemetry WHERE source=? ORDER BY 1",
+                       (source,))["astronaut_id"].tolist()
     return read_df("SELECT DISTINCT astronaut_id FROM telemetry ORDER BY 1")["astronaut_id"].tolist()
 
 
@@ -830,7 +835,7 @@ with tab_data:
 with tab_analytics:
     st.markdown("## ADVANCED HEALTH ANALYTICS")
     st.caption("Descriptive and experimental decision-support outputs. Correlation is not causation; projections are not validated predictions.")
-    analysis_ids = list_astronauts()
+    analysis_ids = list_astronauts(source_key)
     if not analysis_ids:
         st.info("Start simulated monitoring or import CSV telemetry to populate analytics.")
     else:
