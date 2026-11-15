@@ -705,8 +705,14 @@ def mission_view(aid: str, source: str, range_label: str):
 
     # ---- F. alert centre
     st.markdown('<div class="sec">ACTIVE ALERT CENTRE</div>', unsafe_allow_html=True)
-    alerts = read_df("SELECT * FROM live_alerts ORDER BY (status='UNACKNOWLEDGED') DESC, "
-                     "detected_at DESC LIMIT 15")
+    if source == "all":
+        alerts = read_df("SELECT * FROM live_alerts ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
+    elif source == "csv_import":
+        alerts = read_df("SELECT * FROM live_alerts WHERE source IN ('csv_import','csv_historical','csv_new') "
+                         "ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
+    else:
+        alerts = read_df("SELECT * FROM live_alerts WHERE source=? ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15",
+                         (source,))
     if alerts.empty:
         st.success("No alerts generated.")
     for r in alerts.to_dict("records"):
