@@ -291,6 +291,7 @@ class Ingestor:
 
     def __init__(self, source: TelemetrySource):
         self.source, self.interval, self.running = source, 3.0, False
+        self.monitor_mode, self.target_astronaut = "Crew (all astronauts)", None
         self.ticks, self.baselines, self.last_error = 0, {}, ""
         if source.name == "simulated":
             existing = set(read_df(
@@ -344,7 +345,12 @@ class Ingestor:
 
     def _tick(self):
         now = datetime.now(timezone.utc).replace(microsecond=0)
-        rows = [(a, now.strftime(FMT), self.source.name, *v) for a, *v in self.source.read(now)]
+        samples = self.source.read(now)
+        if self.monitor_mode == "Individual astronaut" and self.target_astronaut:
+            samples = [sample for sample in samples if sample[0] == self.target_astronaut]
+        rows = [(a, now.strftime(FMT), self.source.name, *v) for a, *v in samples]
+        if not rows:
+            return
         insert_telemetry(rows)
         self.ticks += 1
         if self.ticks % 20 == 1:
@@ -628,11 +634,14 @@ def mission_view(aid: str, source: str, range_label: str):
 
     # ---- C. astronaut cards
     st.markdown('<div class="sec">ASTRONAUT MONITORING</div>', unsafe_allow_html=True)
-    per_row = 4
-    for i in range(0, len(crew), per_row):
+    visible_crew = ([c for c in crew if c["id"] == aid]
+                    if ing.monitor_mode == "Individual astronaut" else crew)
+    per_row = 4 if ing.monitor_mode != "Individual astronaut" else 1
+    for i in range(0, len(visible_crew), per_row):
         row = st.columns(per_row)
-        for col, c in zip(row, crew[i:i + per_row]):
+        for col, c in zip(row, visible_crew[i:i + per_row]):
             col.markdown(astro_card(c, c["id"] == aid), unsafe_allow_html=True)
+    st.caption("Individual mode ingests and displays only the selected astronaut. Crew mode monitors all available astronauts concurrently.")
 
     # ---- D. telemetry charts
     st.markdown(f'<div class="sec">REAL-TIME TELEMETRY — {html.escape(aid)} — {range_label.upper()} '
@@ -758,7 +767,11 @@ with st.sidebar:
     st.divider()
     st.markdown("### VIEW")
     ids = list_astronauts()
+    monitor_mode = st.radio("Monitoring mode", ["Crew (all astronauts)", "Individual astronaut"],
+                            horizontal=False, key="monitor_mode")
     sel = st.selectbox("Astronaut", ids) if ids else None
+    ing.monitor_mode = monitor_mode
+    ing.target_astronaut = sel if monitor_mode == "Individual astronaut" else None
     range_label = st.select_slider("Time range", list(RANGES), value="24 hours")
     source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
     st.divider()
