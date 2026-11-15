@@ -22,6 +22,7 @@ class ReplayController:
         self.current_timestamp = None
         self.last_error = ""
         self._lock = threading.RLock()
+        self._generation = 0
         self._wake = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="astrawell-csv-replay")
         self._thread.start()
@@ -58,6 +59,7 @@ class ReplayController:
 
     def reset(self):
         with self._lock:
+            self._generation += 1
             self.index = 0
             self.current_timestamp = None
             self.last_error = ""
@@ -82,6 +84,7 @@ class ReplayController:
                     timestamp = self.timestamps[self.index]
                     previous = self.timestamps[self.index - 1] if self.index > 0 else None
                     speed = self.speed
+                    generation = self._generation
                 if previous is not None:
                     try:
                         delta = max((datetime.fromisoformat(timestamp.replace("Z", "+00:00")) -
@@ -100,6 +103,8 @@ class ReplayController:
                 try:
                     self.on_timestamp(timestamp)
                     with self._lock:
+                        if generation != self._generation:
+                            continue
                         self.current_timestamp = timestamp
                         self.index += 1
                 except Exception as exc:
