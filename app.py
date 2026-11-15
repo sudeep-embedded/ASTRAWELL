@@ -739,7 +739,7 @@ with st.sidebar:
     ids = list_astronauts()
     sel = st.selectbox("Astronaut", ids) if ids else None
     range_label = st.select_slider("Time range", list(RANGES), value="24 hours")
-    source_key = SOURCES[st.selectbox("Data source", list(SOURCES))]
+    source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=1, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
     st.divider()
     st.markdown("### DATA INPUT")
     hist_file = st.file_uploader("Historical baseline CSV", type=["csv"], key="historical")
