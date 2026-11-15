@@ -939,9 +939,30 @@ def run_csv_analysis(hf, nf):
         sample_frames = anomaly_samples or historical_sample
         readings_preview = pd.concat(sample_frames, ignore_index=True) if sample_frames else pd.DataFrame()
         anomaly_frame = pd.concat(anomaly_samples, ignore_index=True) if anomaly_samples else pd.DataFrame()
+        astronaut_status = pd.DataFrame()
+        if nf is not None and not anomaly_frame.empty:
+            scored = anomaly_frame.copy()
+            scored["timestamp"] = pd.to_datetime(scored["timestamp"], utc=True, errors="coerce")
+            status_rows = []
+            for astronaut_id, group in scored.groupby("astronaut_id"):
+                latest_time = group["timestamp"].max()
+                latest = group[group["timestamp"].eq(latest_time)]
+                flagged = sorted(group.loc[group["anomaly"].astype(bool), "indicator"].astype(str).unique())
+                status_rows.append({
+                    "astronaut_id": str(astronaut_id),
+                    "condition": "REVIEW" if flagged else "NO FLAGS",
+                    "flagged_indicators": ", ".join(flagged) if flagged else "None",
+                    "latest_reading_utc": latest_time.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(latest_time) else "—",
+                    "readings_scored": int(len(group)),
+                    "max_deviation_score": round(float(group["deviation_score"].max()), 2),
+                })
+            astronaut_status = pd.DataFrame(status_rows).sort_values(
+                ["condition", "astronaut_id"], ascending=[True, True]
+            ).reset_index(drop=True)
         return {"baseline": baseline, "baseline_source": baseline_source,
-                "anomalies": anomaly_frame, "alerts": alerts,
-                "explanations": explanations[:200], "readings": readings_preview}, []
+                "anomalies": anomaly_frame, "astronaut_status": astronaut_status,
+                "alerts": alerts, "explanations": explanations[:200],
+                "readings": readings_preview}, []
     except Exception as exc:
         return None, [str(exc)]
 
@@ -1038,12 +1059,27 @@ with tab_data:
     else:
         st.markdown("### BASELINE")
         st.caption(res.get("baseline_source", "Baseline source not recorded"))
+        if "Provisional engineering references" in res.get("baseline_source", ""):
+            st.warning(
+                "No historical CSV was uploaded. New readings are still analysed against "
+                "provisional engineering reference values, not this astronaut's personal history. "
+                "Treat flags as screening indicators for review, not medical conclusions."
+            )
         st.dataframe(res["baseline"], hide_index=True)
+        st.markdown("### ASTRONAUT CONDITION SUMMARY")
+        status = res.get("astronaut_status", pd.DataFrame())
+        if not status.empty:
+            st.dataframe(status, hide_index=True, use_container_width=True)
+            st.caption("REVIEW means at least one uploaded reading exceeded the configured baseline deviation threshold. NO FLAGS means no such deviation was detected in the uploaded sample; it does not establish that the astronaut is medically healthy.")
+        elif new_file is None:
+            st.caption("Upload a new-readings CSV to calculate current astronaut conditions.")
+        else:
+            st.caption("No scored readings were available for the uploaded new-readings file.")
         st.markdown("### READING COMPARISON")
         if not res["anomalies"].empty:
-            st.dataframe(res["anomalies"], hide_index=True)
+            st.dataframe(res["anomalies"], hide_index=True, use_container_width=True)
         else:
-            st.caption("No separate new-readings file was uploaded. Historical data was imported for monitoring and analytics.")
+            st.caption("No baseline-relative deviations were detected in the new-readings file, or no new-readings file was uploaded.")
         for ex in res["explanations"]:
             with st.expander(f"{str(ex['priority']).upper()} | {ex['alert_id']}"):
                 st.write(ex["summary"])
