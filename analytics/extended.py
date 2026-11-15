@@ -32,9 +32,13 @@ def period_summary(df: pd.DataFrame, period: str = "D") -> pd.DataFrame:
     data = _prepare(df)
     if data.empty:
         return pd.DataFrame()
-    grouped = data.set_index("ts").groupby("astronaut_id").resample(period)
-    agg = grouped[INDICATORS].agg(["mean", "min", "max", "count"])
-    agg.columns = [f"{col}_{stat}" for col, stat in agg.columns]
+    grouped = data.set_index("ts").groupby("astronaut_id").resample(period)[INDICATORS]
+    pieces = []
+    for stat in ("mean", "min", "max", "count"):
+        part = getattr(grouped, stat)()
+        part.columns = [f"{col}_{stat}" for col in part.columns]
+        pieces.append(part)
+    agg = pd.concat(pieces, axis=1)
     return agg.reset_index().rename(columns={"ts": "period"})
 
 
