@@ -482,10 +482,15 @@ def baseline_stats(aid, source) -> dict:
     return out
 
 
-def latest_snapshot(aid, source):
+def latest_snapshot(aid, source, end_at=None):
     clause, p = src_clause(source)
-    df = read_df(f"SELECT * FROM telemetry WHERE astronaut_id=?{clause} ORDER BY ts DESC LIMIT 200",
-                 (aid, *p))
+    if end_at is None:
+        sql = f"SELECT * FROM telemetry WHERE astronaut_id=?{clause} ORDER BY ts DESC LIMIT 200"
+        params = (aid, *p)
+    else:
+        sql = f"SELECT * FROM telemetry WHERE astronaut_id=? AND ts<=?{clause} ORDER BY ts DESC LIMIT 200"
+        params = (aid, pd.Timestamp(end_at).strftime(FMT), *p)
+    df = read_df(sql, params)
     if df.empty:
         return {}, None
     return df.bfill().iloc[0][list(INDICATORS)].to_dict(), df["ts"].iloc[0]
@@ -525,10 +530,10 @@ def sev_color(s) -> str:
     return RED if s in ("critical", "high", "urgent") else AMBER if s in ("medium", "moderate", "warning") else CYAN
 
 
-def crew_snapshot(source):
+def crew_snapshot(source, end_at=None):
     out = []
     for a in list_astronauts(source):
-        vals, last = latest_snapshot(a, source)
+        vals, last = latest_snapshot(a, source, end_at=end_at)
         stats = baseline_stats(a, source)
         z = {c: (vals[c] - stats[c][0]) / stats[c][1]
              for c in INDICATORS if c in stats and pd.notna(vals.get(c))}
@@ -667,6 +672,13 @@ def telemetry_chart(d, col, stats):
 def mission_view(aid: str, source: str, range_label: str):
     ing = get_ingestor()
     now = datetime.now(timezone.utc)
+    replay = st.session_state.get("csv_replay")
+    replay_time = (
+        replay.current_timestamp
+        if replay is not None and replay.current_timestamp
+        and replay.status in {"READY", "RUNNING", "PAUSED", "STOPPED", "COMPLETED"}
+        else None
+    )
     last = read_df("SELECT MAX(ts) m FROM telemetry")["m"][0]
     age = f"{int((now.replace(tzinfo=None) - pd.Timestamp(last).to_pydatetime()).total_seconds())}s ago" \
         if last and ing.running else (last or "—")
@@ -685,7 +697,7 @@ def mission_view(aid: str, source: str, range_label: str):
         f'LAST TELEMETRY UPDATE<br><b>{last or "—"}</b> <span>({age})</span></div></div>',
         unsafe_allow_html=True)
 
-    crew = crew_snapshot(source)
+    crew = crew_snapshot(source, end_at=replay_time)
     if not crew:
         st.info("No telemetry yet. Start monitoring or import CSV data.")
         return
@@ -722,13 +734,6 @@ def mission_view(aid: str, source: str, range_label: str):
     # ---- D. telemetry charts
     st.markdown(f'<div class="sec">REAL-TIME TELEMETRY — {html.escape(aid)} — {range_label.upper()} '
                 f'(ending at latest reading)</div>', unsafe_allow_html=True)
-    replay = st.session_state.get("csv_replay")
-    replay_time = (
-        replay.current_timestamp
-        if replay is not None and replay.current_timestamp
-        and replay.status in {"RUNNING", "PAUSED", "COMPLETED"}
-        else None
-    )
     d = load_window(
         aid, source, LIVE_RANGES.get(range_label, RANGES[range_label]),
         end_at=replay_time,
@@ -1023,7 +1028,7 @@ with st.sidebar:
         rc2.button("Ⅱ PAUSE", key="csv_replay_pause", on_click=replay.pause)
         rc3, rc4 = st.columns(2)
         rc3.button("■ STOP", key="csv_replay_stop", on_click=replay.stop)
-        rc4.button("↺ RESET", key="csv_replay_reset", on_click=replay.reset)
+        rc4.button("↺ RESET VALUES", key="csv_replay_reset", on_click=replay.reset)
         @st.fragment(run_every="1s")
         def _render_replay_status(controller):
             st.caption(f"Replay: {controller.status} · {controller.index:,}/{len(controller.timestamps):,} timestamps")

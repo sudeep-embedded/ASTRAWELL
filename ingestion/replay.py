@@ -61,7 +61,9 @@ class ReplayController:
         with self._lock:
             self._generation += 1
             self.index = 0
-            self.current_timestamp = None
+            # Keep the dashboard on the first replay frame instead of falling
+            # back to the newest database values after an explicit reset.
+            self.current_timestamp = self.timestamps[0] if self.timestamps else None
             self.last_error = ""
             self.status = "READY" if self.timestamps else "EMPTY"
             self._wake.set()
