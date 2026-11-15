@@ -38,8 +38,8 @@ def _clean(frame: pd.DataFrame) -> pd.DataFrame:
 def period_summary(frame: pd.DataFrame, period: str = "D") -> pd.DataFrame:
     """Return per-astronaut indicator means and sample counts by period."""
     d = _clean(frame)
-    freq = {"daily": "D", "weekly": "W-MON", "monthly": "MS",
-            "D": "D", "W": "W-MON", "M": "MS", "MS": "MS"}.get(period)
+    freq = {"daily": "D", "weekly": "W-MON", "monthly": "M",
+            "D": "D", "W": "W-MON", "M": "M", "MS": "M"}.get(period)
     if freq is None:
         raise ValueError("period must be daily, weekly, or monthly")
     available = [c for c in INDICATORS if c in d]
