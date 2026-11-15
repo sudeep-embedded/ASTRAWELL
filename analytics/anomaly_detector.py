@@ -1,47 +1,46 @@
-
+"""Baseline-relative anomaly scoring."""
+import numpy as np
 import pandas as pd
 
 
-def detect_anomalies(df, baseline):
+def detect_anomalies(df, baseline, threshold=2.0, minimum_std=1e-9):
+    """Score each reading against its own astronaut/indicator baseline.
 
-    results = []
-
+    deviation_score is absolute z-score for backward compatibility; signed_z_score
+    preserves direction. Baselines with fewer than two observations are not scored.
+    """
+    required = {"astronaut_id", "indicator", "value"}
+    if required - set(df.columns) or {"astronaut_id", "indicator", "mean", "std", "count"} - set(baseline.columns):
+        raise ValueError("Readings/baseline are missing required columns")
+    lookup = baseline.set_index(["astronaut_id", "indicator"])
+    rows = []
     for _, reading in df.iterrows():
-
-        astronaut_id = reading["astronaut_id"]
-        indicator = reading["indicator"]
-        value = reading["value"]
-
-        matching = baseline[
-            (baseline["astronaut_id"] == astronaut_id) &
-            (baseline["indicator"] == indicator)
-        ]
-
-        if matching.empty:
+        key = (reading["astronaut_id"], reading["indicator"])
+        if key not in lookup.index:
             continue
-
-        reference = matching.iloc[0]
-
-        mean = reference["mean"]
-        std = reference["std"]
-
-        # Avoid division by zero
-        if std == 0:
-            deviation_score = 0 if value == mean else float("inf")
-        else:
-            deviation_score = abs(value - mean) / std
-
-        # Flag readings more than 2 standard deviations away
-        is_anomaly = deviation_score > 2
-
-        results.append({
-            "astronaut_id": astronaut_id,
-            "timestamp": reading["timestamp"],
-            "indicator": indicator,
-            "current_value": value,
+        ref = lookup.loc[key]
+        if isinstance(ref, pd.DataFrame):
+            ref = ref.iloc[0]
+        value = pd.to_numeric(pd.Series([reading["value"]]), errors="coerce").iloc[0]
+        if pd.isna(value) or int(ref["count"]) < 2:
+            continue
+        mean, std = float(ref["mean"]), float(ref["std"])
+        signed = (float(value) - mean) / max(std, minimum_std)
+        score = abs(signed)
+        row = {
+            "astronaut_id": reading["astronaut_id"],
+            "timestamp": reading.get("timestamp", reading.get("ts")),
+            "indicator": reading["indicator"],
+            "current_value": float(value),
             "baseline_mean": mean,
-            "deviation_score": deviation_score,
-            "anomaly": is_anomaly
-        })
-
-    return pd.DataFrame(results)
+            "baseline_count": int(ref["count"]),
+            "signed_z_score": signed,
+            "deviation_score": score,
+            "anomaly": bool(score > threshold),
+        }
+        rows.append(row)
+    return pd.DataFrame(rows, columns=[
+        "astronaut_id", "timestamp", "indicator", "current_value",
+        "baseline_mean", "baseline_count", "signed_z_score",
+        "deviation_score", "anomaly"
+    ])
