@@ -26,7 +26,7 @@ def prepare_telemetry_csv(frame: pd.DataFrame) -> pd.DataFrame:
     present_wide = required_wide | (set(data.columns) & set(WIDE_COLUMNS))
     if not required_wide.issubset(data.columns):
         missing = sorted(required_wide - set(data.columns))
-        raise ValueError(f"CSV is missing required identity columns: {missing}")
+        raise ValueError(f"Unsupported CSV schema. Missing required identity columns: {missing}")
     measurement_columns = [column for column in WIDE_COLUMNS if column in data.columns]
     if not measurement_columns:
         raise ValueError(
