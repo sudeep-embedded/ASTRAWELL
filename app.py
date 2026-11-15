@@ -796,80 +796,126 @@ def provisional_baseline(astronaut_ids):
     return pd.DataFrame(rows)
 
 
-def _read_validated_upload(upload, label):
-    raw = upload.getvalue()
-    raw_frame = pd.read_csv(io.BytesIO(raw))
+def _hash_upload(upload):
+    digest = hashlib.sha256()
+    upload.seek(0)
+    while True:
+        block = upload.read(1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    upload.seek(0)
+    return digest.digest()
+
+
+def _iter_validated_upload(upload, label, chunksize=20000):
+    """Read CSV in bounded chunks; wide rows expand to at most five long rows each."""
+    upload.seek(0)
     try:
-        canonical = prepare_telemetry_csv(raw_frame)
-    except ValueError as exc:
-        raise ValueError(f"{label}: {exc}") from exc
-    validation = validate_health_data(canonical)
-    if not validation["valid"]:
-        raise ValueError(f"{label}: " + "; ".join(map(str, validation["errors"][:20])))
-    normalised = normalize_health_data(canonical)
-    normalised["timestamp"] = pd.to_datetime(normalised["timestamp"], utc=True, errors="coerce")
-    normalised["astronaut_id"] = normalised["astronaut_id"].astype(str).str.strip()
-    normalised = normalised.dropna(subset=["astronaut_id", "timestamp", "value"])
-    if normalised.empty:
-        raise ValueError(f"{label}: no valid telemetry rows remain after parsing.")
-    return raw, normalised
+        chunks = pd.read_csv(upload, chunksize=chunksize)
+        seen_keys = set()
+        total = 0
+        for raw_chunk in chunks:
+            canonical = prepare_telemetry_csv(raw_chunk)
+            canonical = normalize_health_data(canonical)
+            canonical["timestamp"] = pd.to_datetime(canonical["timestamp"], utc=True, errors="coerce")
+            canonical["value"] = pd.to_numeric(canonical["value"], errors="coerce")
+            canonical["astronaut_id"] = canonical["astronaut_id"].astype("string").str.strip()
+            canonical["indicator"] = canonical["indicator"].astype("string").str.strip().str.lower()
+            canonical["unit"] = canonical["unit"].astype("string").str.strip()
+            canonical["source"] = canonical["source"].astype("string").str.strip().str.lower()
+            if canonical[["astronaut_id", "timestamp", "indicator", "unit", "source", "value"]].isna().any().any():
+                raise ValueError(f"{label}: missing ID, timestamp, indicator, unit, source, or numeric measurement.")
+            validation = validate_health_data(canonical)
+            if not validation["valid"]:
+                raise ValueError(f"{label}: " + "; ".join(map(str, validation["errors"][:10])))
+            dup = canonical.duplicated(["astronaut_id", "timestamp", "indicator"])
+            if dup.any():
+                raise ValueError(f"{label}: {int(dup.sum())} duplicate astronaut/timestamp/indicator rows in a CSV chunk.")
+            total += len(canonical)
+            yield canonical
+        if total == 0:
+            raise ValueError(f"{label}: the CSV contains no telemetry rows.")
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError(f"{label}: the CSV is empty.") from exc
+    finally:
+        upload.seek(0)
 
 
-def provisional_baseline(astronaut_ids):
-    """Engineering reference values only; not clinical thresholds or diagnosis."""
-    references = {
-        "heart_rate": (75.0, 15.0), "spo2": (97.0, 1.5),
-        "temperature": (36.8, 0.4), "sleep_duration": (7.0, 1.5),
-        "fatigue": (2.0, 1.0),
-    }
+def _baseline_from_aggregates(aggregates):
     rows = []
-    for aid in sorted(set(astronaut_ids)):
-        for indicator, (mean, std) in references.items():
-            rows.append({"astronaut_id": aid, "indicator": indicator, "mean": mean,
-                         "std": std, "minimum": float("nan"), "maximum": float("nan"), "count": 2})
-    return pd.DataFrame(rows)
+    for (aid, indicator), values in aggregates.items():
+        count, total, total_sq, minimum, maximum = values
+        mean = total / count
+        variance = max((total_sq - count * mean * mean) / max(count - 1, 1), 0.0)
+        rows.append({"astronaut_id": aid, "indicator": indicator, "mean": mean,
+                     "std": variance ** 0.5, "minimum": minimum, "maximum": maximum, "count": count})
+    return pd.DataFrame(rows, columns=[
+        "astronaut_id", "indicator", "mean", "std", "minimum", "maximum", "count"
+    ])
 
 
 def run_csv_analysis(hf, nf):
-    """Analyse historical-only, new-only, or combined long-/wide-format CSV uploads."""
+    """Chunked historical/new CSV analysis; memory use is bounded by chunksize."""
     if hf is None and nf is None:
         return None, ["Upload historical data, new readings, or both."]
     try:
-        raw_h, historical = _read_validated_upload(hf, "Historical dataset") if hf is not None else (b"", None)
-        raw_n, new = _read_validated_upload(nf, "New readings dataset") if nf is not None else (b"", None)
-        if historical is not None:
-            baseline = calculate_baseline(historical)
-            baseline_source = "Uploaded historical dataset"
+        hash_h = _hash_upload(hf) if hf is not None else b""
+        hash_n = _hash_upload(nf) if nf is not None else b""
+        aggregates = {}
+        historical_ids = set()
+        historical_sample = []
+        if hf is not None:
+            for chunk in _iter_validated_upload(hf, "Historical dataset"):
+                for (aid, indicator), group in chunk.groupby(["astronaut_id", "indicator"]):
+                    values = group["value"].astype(float)
+                    key = (str(aid), str(indicator))
+                    current = aggregates.get(key, [0, 0.0, 0.0, float("inf"), float("-inf")])
+                    aggregates[key] = [
+                        current[0] + len(values), current[1] + float(values.sum()),
+                        current[2] + float((values * values).sum()),
+                        min(current[3], float(values.min())), max(current[4], float(values.max()))
+                    ]
+                    historical_ids.add(str(aid))
+                import_long_frame(chunk, f"Historical CSV '{hf.name}' chunk", source="csv_historical")
+                if len(historical_sample) < 5000:
+                    historical_sample.append(chunk.head(5000 - len(historical_sample)))
+            baseline = _baseline_from_aggregates(aggregates)
+            baseline_source = "Uploaded historical dataset (chunked)"
         else:
-            baseline = provisional_baseline(new["astronaut_id"].unique())
+            baseline = None
             baseline_source = "Provisional engineering references — no historical dataset uploaded"
 
-        anomalies, alerts, expl = pd.DataFrame(), [], []
-        if new is not None:
-            anomalies = detect_anomalies(new, baseline)
-            alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
-            expl = [explain_alert(a) for a in alerts]
+        alerts, explanations, anomaly_samples, new_ids = [], [], [], set()
+        if nf is not None:
+            for chunk in _iter_validated_upload(nf, "New readings dataset"):
+                new_ids.update(chunk["astronaut_id"].astype(str).unique())
+                active_baseline = baseline if baseline is not None else provisional_baseline(chunk["astronaut_id"].unique())
+                anomalies = detect_anomalies(chunk, active_baseline)
+                if not anomalies.empty:
+                    if len(anomaly_samples) < 10000:
+                        anomaly_samples.append(anomalies.head(10000 - len(anomaly_samples)))
+                    generated = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
+                    alerts.extend(generated)
+                    explanations.extend(explain_alert(a) for a in generated)
+                import_long_frame(chunk, f"New readings CSV '{nf.name}' chunk", source="csv_new")
 
-        if historical is not None:
-            import_long_frame(historical, f"Historical CSV '{hf.name}'", source="csv_historical")
-        if new is not None:
-            import_long_frame(new, f"New readings CSV '{nf.name}'", source="csv_new")
-
-        upload_hash = hashlib.sha256(raw_h + b"::ASTRAWELL::" + raw_n).hexdigest()
-        if register_import(upload_hash, hf.name if hf is not None else nf.name):
-            if historical is not None:
-                save_health_readings(historical)
-                save_baselines(calculate_baseline(historical))
-            if new is not None:
-                save_alerts(alerts)
-        reference_time = (str(new["timestamp"].max()) if new is not None
-                          else str(historical["timestamp"].max()))
-        created = ingest_alerts(alerts, "csv_import", "UNKNOWN", reference_time)
+        if baseline is None:
+            baseline = provisional_baseline(new_ids)
+        combined_hash = hashlib.sha256(hash_h + b"::ASTRAWELL::" + hash_n).hexdigest()
+        register_import(combined_hash, hf.name if hf is not None else nf.name)
+        if alerts:
+            reference_time = max(str(a.get("timestamp", "")) for a in alerts)
+            ingest_alerts(alerts, "csv_import", "UNKNOWN", reference_time or now_ts())
+            save_alerts(alerts[:1000])
         log_event("ANALYSIS", "—",
-                  f"CSV analysis complete ({baseline_source}): {len(alerts)} alert(s), {created} new")
+                  f"Chunked CSV analysis complete ({baseline_source}): {len(alerts)} alert(s)")
+        sample_frames = anomaly_samples or historical_sample
+        readings_preview = pd.concat(sample_frames, ignore_index=True) if sample_frames else pd.DataFrame()
+        anomaly_frame = pd.concat(anomaly_samples, ignore_index=True) if anomaly_samples else pd.DataFrame()
         return {"baseline": baseline, "baseline_source": baseline_source,
-                "anomalies": anomalies, "alerts": alerts, "explanations": expl,
-                "readings": new if new is not None else historical}, []
+                "anomalies": anomaly_frame, "alerts": alerts,
+                "explanations": explanations[:200], "readings": readings_preview}, []
     except Exception as exc:
         return None, [str(exc)]
 
