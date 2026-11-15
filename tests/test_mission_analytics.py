@@ -45,3 +45,11 @@ def test_trend_projection_is_experimental_and_numeric():
 def test_build_report_can_scope_one_astronaut():
     result = build_report(sample_frame(), "A")
     assert set(result["readings"]["astronaut_id"]) == {"A"}
+
+
+def test_weekly_and_monthly_summary_periods():
+    weekly = period_summary(sample_frame(), "weekly")
+    monthly = period_summary(sample_frame(), "monthly")
+    assert not weekly.empty
+    assert not monthly.empty
+    assert {"astronaut_id", "period", "reading_count"}.issubset(monthly.columns)
