@@ -995,8 +995,8 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### VIEW")
-    source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
-    ids = list_astronauts(source_key)
+    source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=0, help="All sources combines simulated crew telemetry with imported CSV records. Choose a single source to isolate it.")]
+    ids = sorted(set(list_astronauts(source_key)) | (set(CREW) if source_key in {"all", "simulated"} else set()))
     monitor_mode = st.radio("Monitoring mode", ["Crew (all astronauts)", "Individual astronaut"],
                             horizontal=False, key="monitor_mode")
     sel = st.selectbox("Astronaut", ids, key=f"astronaut_selector_{source_key}") if ids else None
