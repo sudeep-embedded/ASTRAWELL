@@ -27,8 +27,7 @@ import streamlit as st
 from analytics.baseline import calculate_baseline
 from analytics.anomaly_detector import detect_anomalies
 from analytics.rule_engine import evaluate_health_patterns
-from analytics.extended import period_summary, crew_comparison, correlation_matrix, linear_trend_estimates
-from reporting.pdf_report import build_health_report
+from analytics.mission_analytics import (period_summary, crew_comparison, indicator_correlations, trend_projection, build_report, report_pdf)
 from preprocessing.validator import validate_health_data
 from preprocessing.normalizer import normalize_health_data
 from decision_support.alert_generator import generate_alerts
@@ -810,19 +809,19 @@ with tab_analytics:
         with p1:
             period_choice = st.selectbox("Summary interval", ["Daily", "Weekly", "Monthly"], key="summary_period")
         with p2:
-            horizon = st.selectbox("Experimental estimate horizon", [3, 6, 12], index=1, format_func=lambda x: f"{x} hours")
+            horizon = st.selectbox("Experimental estimate horizon", [3, 6, 12], index=1, format_func=lambda x: f"{x} readings")
         with p3:
             st.metric("Crew profiles with data", len(all_frames))
 
         period_code = {"Daily": "D", "Weekly": "W", "Monthly": "MS"}[period_choice]
-        summary = period_summary(selected_readings, period_code)
+        summary = period_summary(selected_readings, period_choice.lower())
         st.markdown(f"### {period_choice.upper()} SUMMARY — {html.escape(sel)}")
         if summary.empty:
             st.info("Not enough telemetry for a summary.")
         else:
             summary_view = summary.copy()
             summary_view["period"] = pd.to_datetime(summary_view["period"]).dt.strftime("%Y-%m-%d")
-            display_cols = ["period"] + [f"{c}_mean" for c in INDICATORS] + [f"{c}_count" for c in INDICATORS]
+            display_cols = ["period", *INDICATORS, "reading_count"]
             st.dataframe(summary_view[[c for c in display_cols if c in summary_view]], hide_index=True, use_container_width=True)
             st.download_button("DOWNLOAD SUMMARY CSV", summary_view.to_csv(index=False).encode("utf-8"),
                                file_name=f"astrawell_{sel}_{period_choice.lower()}_summary.csv", mime="text/csv")
@@ -832,12 +831,12 @@ with tab_analytics:
         if comparison.empty:
             st.info("Crew comparison requires at least five readings per indicator.")
         else:
-            comp_cols = ["astronaut_id", "timestamp", *INDICATORS, "largest_baseline_deviation"]
+            comp_cols = ["Astronaut", "Readings", *[f"{c}_current" for c in INDICATORS], *[f"{c}_z" for c in INDICATORS]]
             st.dataframe(comparison[[c for c in comp_cols if c in comparison]], hide_index=True, use_container_width=True)
-            st.caption("Largest deviation is the maximum absolute z-score across available indicators. It is a statistical ranking, not a medical risk score.")
+            st.caption("Each z-score compares the latest value with that astronaut’s own historical mean and standard deviation. It is not a medical risk score.")
 
         st.markdown("### MULTI-INDICATOR CORRELATION")
-        corr = correlation_matrix(selected_readings)
+        corr = indicator_correlations(selected_readings)
         if corr.empty:
             st.info("Not enough overlapping telemetry to calculate correlations.")
         else:
@@ -848,8 +847,8 @@ with tab_analytics:
             fig_corr.update_layout(template="plotly_dark", height=390, margin=dict(l=20, r=20, t=20, b=20))
             st.plotly_chart(fig_corr, use_container_width=True, key="correlation_heatmap")
 
-        st.markdown(f"### EXPERIMENTAL TREND ESTIMATES — NEXT {horizon} HOURS")
-        estimates = linear_trend_estimates(selected_readings, horizon_hours=int(horizon))
+        st.markdown(f"### EXPERIMENTAL TREND ESTIMATES — NEXT {horizon} READINGS")
+        estimates = trend_projection(selected_readings, steps=int(horizon))
         if estimates.empty:
             st.info("At least six timestamped readings per indicator are needed for a trend estimate.")
         else:
@@ -857,8 +856,7 @@ with tab_analytics:
             st.warning("These values are simple linear extrapolations of recent data. They are not clinically validated forecasts and should not guide treatment or mission decisions without approved review.")
 
         st.markdown("### EXPORT ASTRONAUT REPORT")
-        pdf_bytes = build_health_report(sel, selected_readings, period_summary(selected_readings, "D"),
-                                        comparison, now_ts())
+        pdf_bytes = report_pdf(build_report(selected_readings, sel), title=f"ASTRAWELL Health Report — {sel}")
         st.download_button("DOWNLOAD PDF HEALTH REPORT", pdf_bytes,
                            file_name=f"ASTRAWELL_{sel}_health_report.pdf", mime="application/pdf")
         st.download_button("DOWNLOAD SELECTED TELEMETRY CSV", selected_readings.to_csv(index=False).encode("utf-8"),
