@@ -57,7 +57,7 @@ RANGES = {"1 hour": timedelta(hours=1), "6 hours": timedelta(hours=6),
 SOURCES = {"All sources": "all", "Simulated": "simulated", "CSV import": "csv_import"}
 # Thirty deterministic synthetic crew profiles. Values are illustrative baselines,
 # not measurements or medically validated limits.
-CREW = [f"SIM-{i:02d}" for i in range(1, 31)]
+CREW = [f"AST{i:03d}" for i in range(1, 31)]
 PROFILE = {
     aid: (
         60 + ((i * 7) % 19),                 # resting HR baseline: 60–78 bpm
@@ -766,14 +766,16 @@ with st.sidebar:
     ing.interval = float(interval)
     st.divider()
     st.markdown("### VIEW")
-    ids = list_astronauts()
+    source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
+    ids = (CREW if source_key == "simulated" else
+           read_df("SELECT DISTINCT astronaut_id FROM telemetry WHERE source=? ORDER BY 1",
+                   ("csv_import",))["astronaut_id"].tolist() if source_key == "csv_import" else list_astronauts())
     monitor_mode = st.radio("Monitoring mode", ["Crew (all astronauts)", "Individual astronaut"],
                             horizontal=False, key="monitor_mode")
     sel = st.selectbox("Astronaut", ids) if ids else None
     ing.monitor_mode = monitor_mode
     ing.target_astronaut = sel if monitor_mode == "Individual astronaut" else None
     range_label = st.select_slider("Time range", list(RANGES), value="24 hours")
-    source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
     st.divider()
     st.markdown("### DATA INPUT")
     hist_file = st.file_uploader("Historical baseline CSV", type=["csv"], key="historical")
