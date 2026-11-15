@@ -30,6 +30,7 @@ from analytics.rule_engine import evaluate_health_patterns
 from analytics.mission_analytics import (period_summary, crew_comparison, deterioration_comparison, indicator_correlations, trend_projection, build_report, report_pdf)
 from preprocessing.validator import validate_health_data
 from ingestion.telemetry_csv import prepare_telemetry_csv
+from ingestion.replay import ReplayController
 from preprocessing.normalizer import normalize_health_data
 from decision_support.alert_generator import generate_alerts
 from decision_support.explanations import explain_alert
@@ -748,6 +749,36 @@ def mission_view(aid: str, source: str, range_label: str):
 # ============================== CSV ANALYSIS (existing workflow, preserved) ==============================
 
 
+
+def process_csv_replay_timestamp(timestamp):
+    """Run imported records at one original timestamp through the anomaly/alert pipeline."""
+    rows = read_df(
+        "SELECT * FROM telemetry WHERE ts=? AND source IN ('csv_new','csv_import') ORDER BY astronaut_id",
+        (timestamp,),
+    )
+    for _, row in rows.iterrows():
+        aid = str(row["astronaut_id"])
+        history = read_df(
+            "SELECT * FROM telemetry WHERE astronaut_id=? AND source IN ('csv_historical','csv_import') "
+            "ORDER BY ts DESC LIMIT 2000", (aid,),
+        )
+        if history.empty:
+            baseline = provisional_baseline([aid])
+        else:
+            baseline = calculate_baseline(to_long(history))
+        current = to_long(pd.DataFrame([row]))
+        anomalies = detect_anomalies(current, baseline)
+        alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
+        ingest_alerts(alerts, "csv_replay", aid, timestamp)
+
+
+def create_csv_replay(speed=1.0):
+    timestamps = read_df(
+        "SELECT DISTINCT ts FROM telemetry WHERE source IN ('csv_new','csv_import') ORDER BY ts"
+    )["ts"].astype(str).tolist()
+    return ReplayController(timestamps, process_csv_replay_timestamp, speed=speed)
+
+
 def provisional_baseline(astronaut_ids):
     """Transparent engineering reference baseline used only when no history was uploaded."""
     references = {
@@ -862,6 +893,31 @@ with st.sidebar:
     interval = st.slider("Telemetry sampling interval (seconds)", 1, 30, int(ing.interval),
                          help="At 1 second, one fresh reading is generated per monitored astronaut every second.")
     ing.interval = float(interval)
+    st.divider()
+    st.markdown("### CSV REPLAY")
+    replay = st.session_state.get("csv_replay")
+    if st.button("PREPARE / RESET CSV REPLAY", key="prepare_csv_replay"):
+        st.session_state["csv_replay"] = create_csv_replay(
+            st.session_state.get("csv_replay_speed", 1.0)
+        )
+        replay = st.session_state["csv_replay"]
+    replay_speed = st.selectbox("CSV playback speed", [1, 2, 5, 10, 60], index=0,
+                                format_func=lambda x: f"{x}x", key="csv_replay_speed")
+    if replay is not None:
+        replay.set_speed(replay_speed)
+        rc1, rc2 = st.columns(2)
+        rc1.button("▶ PLAY / RESUME", key="csv_replay_start", on_click=replay.resume)
+        rc2.button("Ⅱ PAUSE", key="csv_replay_pause", on_click=replay.pause)
+        rc3, rc4 = st.columns(2)
+        rc3.button("■ STOP", key="csv_replay_stop", on_click=replay.stop)
+        rc4.button("↺ RESET", key="csv_replay_reset", on_click=replay.reset)
+        st.caption(f"Replay: {replay.status} · {replay.index:,}/{len(replay.timestamps):,} timestamps")
+        st.progress(replay.progress)
+        if replay.current_timestamp:
+            st.caption(f"Source timestamp: {replay.current_timestamp} UTC")
+        if replay.last_error:
+            st.error(replay.last_error)
+
     st.divider()
     st.markdown("### VIEW")
     source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
