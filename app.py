@@ -750,6 +750,9 @@ def mission_view(aid: str, source: str, range_label: str):
 
 
 
+_REPLAY_BASELINE_CACHE = {}
+
+
 def process_csv_replay_timestamp(timestamp):
     """Run imported records at one original timestamp through the anomaly/alert pipeline."""
     rows = read_df(
@@ -758,14 +761,15 @@ def process_csv_replay_timestamp(timestamp):
     )
     for _, row in rows.iterrows():
         aid = str(row["astronaut_id"])
-        history = read_df(
-            "SELECT * FROM telemetry WHERE astronaut_id=? AND source IN ('csv_historical','csv_import') "
-            "ORDER BY ts DESC LIMIT 2000", (aid,),
-        )
-        if history.empty:
-            baseline = provisional_baseline([aid])
-        else:
-            baseline = calculate_baseline(to_long(history))
+        if aid not in _REPLAY_BASELINE_CACHE:
+            history = read_df(
+                "SELECT * FROM telemetry WHERE astronaut_id=? AND source IN ('csv_historical','csv_import') "
+                "ORDER BY ts DESC LIMIT 2000", (aid,),
+            )
+            _REPLAY_BASELINE_CACHE[aid] = (
+                provisional_baseline([aid]) if history.empty else calculate_baseline(to_long(history))
+            )
+        baseline = _REPLAY_BASELINE_CACHE[aid]
         current = to_long(pd.DataFrame([row]))
         anomalies = detect_anomalies(current, baseline)
         alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
@@ -773,6 +777,7 @@ def process_csv_replay_timestamp(timestamp):
 
 
 def create_csv_replay(speed=1.0):
+    _REPLAY_BASELINE_CACHE.clear()
     timestamps = read_df(
         "SELECT DISTINCT ts FROM telemetry WHERE source IN ('csv_new','csv_import') ORDER BY ts"
     )["ts"].astype(str).tolist()
@@ -813,7 +818,6 @@ def _iter_validated_upload(upload, label, chunksize=20000):
     upload.seek(0)
     try:
         chunks = pd.read_csv(upload, chunksize=chunksize)
-        seen_keys = set()
         total = 0
         for raw_chunk in chunks:
             canonical = prepare_telemetry_csv(raw_chunk)
@@ -849,7 +853,6 @@ def run_csv_analysis(hf, nf):
         hash_h = _hash_upload(hf) if hf is not None else b""
         hash_n = _hash_upload(nf) if nf is not None else b""
         aggregates = {}
-        historical_ids = set()
         historical_sample = []
         if hf is not None:
             for chunk in _iter_validated_upload(hf, "Historical dataset"):
@@ -862,7 +865,6 @@ def run_csv_analysis(hf, nf):
                         current[2] + float((values * values).sum()),
                         min(current[3], float(values.min())), max(current[4], float(values.max()))
                     ]
-                    historical_ids.add(str(aid))
                 import_long_frame(chunk, f"Historical CSV '{hf.name}' chunk", source="csv_historical")
                 if len(historical_sample) < 5000:
                     historical_sample.append(chunk.head(5000 - len(historical_sample)))
