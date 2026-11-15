@@ -27,6 +27,7 @@ import streamlit as st
 from analytics.baseline import calculate_baseline
 from analytics.anomaly_detector import detect_anomalies
 from analytics.rule_engine import evaluate_health_patterns
+from analytics.mission_analytics import (period_summary, crew_comparison, deterioration_comparison, indicator_correlations, trend_projection, build_report, report_pdf)
 from preprocessing.validator import validate_health_data
 from preprocessing.normalizer import normalize_health_data
 from decision_support.alert_generator import generate_alerts
@@ -738,7 +739,7 @@ with st.sidebar:
     ids = list_astronauts()
     sel = st.selectbox("Astronaut", ids) if ids else None
     range_label = st.select_slider("Time range", list(RANGES), value="24 hours")
-    source_key = SOURCES[st.selectbox("Data source", list(SOURCES))]
+    source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
     st.divider()
     st.markdown("### DATA INPUT")
     hist_file = st.file_uploader("Historical baseline CSV", type=["csv"], key="historical")
@@ -757,7 +758,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Analysis failed: {e}")
 
-tab_mc, tab_data, tab_sys = st.tabs(["MISSION CONTROL", "DATA & ANALYTICS", "SYSTEM"])
+tab_mc, tab_data, tab_analytics, tab_sys = st.tabs(["MISSION CONTROL", "DATA & ANALYTICS", "ADVANCED ANALYTICS", "SYSTEM"])
 
 with tab_mc:
     if sel is None:
@@ -788,6 +789,105 @@ with tab_data:
     st.markdown("### STORED ALERT HISTORY (database/db.py)")
     hist = get_alert_history()
     st.dataframe(pd.DataFrame(hist), hide_index=True) if hist else st.caption("No stored alert history.")
+
+
+with tab_analytics:
+    st.markdown("## ADVANCED HEALTH ANALYTICS")
+    st.caption("Descriptive and experimental decision-support outputs. Correlation is not causation; projections are not validated predictions.")
+    analysis_ids = list_astronauts()
+    if not analysis_ids:
+        st.info("Start simulated monitoring or import CSV telemetry to populate analytics.")
+    else:
+        analysis_aid = st.selectbox("Select astronaut for individual analysis", analysis_ids,
+                                    index=analysis_ids.index(sel) if sel in analysis_ids else 0,
+                                    key="analytics_astronaut")
+        selected_readings = load_window(analysis_aid, source_key, RANGES["30 days"])
+        all_frames = []
+        for crew_id in analysis_ids:
+            frame = load_window(crew_id, source_key, RANGES["30 days"])
+            if not frame.empty:
+                all_frames.append(frame)
+        combined = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+
+        st.markdown("### CREW DETERIORATION COMPARISON — WHO IS CHANGING FASTEST?")
+        deterioration = deterioration_comparison(combined)
+        if deterioration.empty:
+            st.info("Not enough timestamped history across the crew. Each astronaut needs at least six distinct days and multiple readings in the early and late portions of the window.")
+        else:
+            display_deterioration = deterioration.drop(columns=["_details"], errors="ignore")
+            st.dataframe(display_deterioration, hide_index=True, use_container_width=True)
+            st.caption("Ranked by adverse movement from the first third to the last third of each astronaut's own 30-day timeline. Higher heart rate/temperature/fatigue and lower SpO₂/sleep count as adverse. This experimental index is not a medical severity score.")
+            with st.expander("WHY IS EACH ASTRONAUT RANKED HERE?"):
+                for item in deterioration.to_dict("records"):
+                    st.markdown(f"**#{item['Rank']} — {item['Astronaut']}**")
+                    st.write(item["Main drivers"])
+                    detail_rows = []
+                    for indicator, values in item["_details"].items():
+                        detail_rows.append({
+                            "Indicator": indicator,
+                            "Early-period mean": round(values["early_mean"], 3),
+                            "Late-period mean": round(values["late_mean"], 3),
+                            "Adverse shift (σ)": round(values["adverse_change_sigma"], 2),
+                        })
+                    if detail_rows:
+                        st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            period_choice = st.selectbox("Summary interval", ["Daily", "Weekly", "Monthly"], key="summary_period")
+        with p2:
+            horizon = st.selectbox("Experimental estimate horizon", [3, 6, 12], index=1, format_func=lambda x: f"{x} readings")
+        with p3:
+            st.metric("Crew profiles with data", len(all_frames))
+
+        period_code = {"Daily": "D", "Weekly": "W", "Monthly": "MS"}[period_choice]
+        summary = period_summary(selected_readings, period_choice.lower())
+        st.markdown(f"### {period_choice.upper()} SUMMARY — {html.escape(analysis_aid)}")
+        if summary.empty:
+            st.info("Not enough telemetry for a summary.")
+        else:
+            summary_view = summary.copy()
+            summary_view["period"] = pd.to_datetime(summary_view["period"]).dt.strftime("%Y-%m-%d")
+            display_cols = ["period", *INDICATORS, "reading_count"]
+            st.dataframe(summary_view[[c for c in display_cols if c in summary_view]], hide_index=True, use_container_width=True)
+            st.download_button("DOWNLOAD SUMMARY CSV", summary_view.to_csv(index=False).encode("utf-8"),
+                               file_name=f"astrawell_{analysis_aid}_{period_choice.lower()}_summary.csv", mime="text/csv")
+
+        st.markdown("### CREW COMPARISON — EACH ASTRONAUT VS THEIR OWN BASELINE")
+        comparison = crew_comparison(combined)
+        if comparison.empty:
+            st.info("Crew comparison requires at least five readings per indicator.")
+        else:
+            comp_cols = ["Astronaut", "Readings", *[f"{c}_current" for c in INDICATORS], *[f"{c}_z" for c in INDICATORS]]
+            st.dataframe(comparison[[c for c in comp_cols if c in comparison]], hide_index=True, use_container_width=True)
+            st.caption("Each z-score compares the latest value with that astronaut’s own historical mean and standard deviation. It is not a medical risk score.")
+
+        st.markdown("### MULTI-INDICATOR CORRELATION")
+        corr = indicator_correlations(selected_readings)
+        if corr.empty:
+            st.info("Not enough overlapping telemetry to calculate correlations.")
+        else:
+            st.dataframe(corr.round(2), use_container_width=True)
+            fig_corr = go.Figure(data=go.Heatmap(z=corr.values, x=corr.columns, y=corr.index,
+                                                  zmin=-1, zmax=1, colorscale="RdBu", text=corr.round(2).values,
+                                                  texttemplate="%{text}"))
+            fig_corr.update_layout(template="plotly_dark", height=390, margin=dict(l=20, r=20, t=20, b=20))
+            st.plotly_chart(fig_corr, use_container_width=True, key="correlation_heatmap")
+
+        st.markdown(f"### EXPERIMENTAL TREND ESTIMATES — NEXT {horizon} READINGS")
+        estimates = trend_projection(selected_readings, steps=int(horizon))
+        if estimates.empty:
+            st.info("At least six timestamped readings per indicator are needed for a trend estimate.")
+        else:
+            st.dataframe(estimates.round(3), hide_index=True, use_container_width=True)
+            st.warning("These values are simple linear extrapolations of recent data. They are not clinically validated forecasts and should not guide treatment or mission decisions without approved review.")
+
+        st.markdown("### EXPORT ASTRONAUT REPORT")
+        pdf_bytes = report_pdf(build_report(selected_readings, analysis_aid), title=f"ASTRAWELL Health Report — {analysis_aid}")
+        st.download_button("DOWNLOAD PDF HEALTH REPORT", pdf_bytes,
+                           file_name=f"ASTRAWELL_{analysis_aid}_health_report.pdf", mime="application/pdf")
+        st.download_button("DOWNLOAD SELECTED TELEMETRY CSV", selected_readings.to_csv(index=False).encode("utf-8"),
+                           file_name=f"ASTRAWELL_{analysis_aid}_telemetry.csv", mime="text/csv")
 
 with tab_sys:
     st.markdown("## SYSTEM INFORMATION")
