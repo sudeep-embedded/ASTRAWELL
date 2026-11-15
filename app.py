@@ -491,10 +491,18 @@ def latest_snapshot(aid, source):
     return df.bfill().iloc[0][list(INDICATORS)].to_dict(), df["ts"].iloc[0]
 
 
-def load_window(aid, source, delta) -> pd.DataFrame:
-    """Window is anchored to the astronaut's latest reading, so historical CSVs display too."""
+def load_window(aid, source, delta, end_at=None) -> pd.DataFrame:
+    """Load a time window; end_at lets CSV replay reveal readings progressively."""
     clause, p = src_clause(source)
-    end = read_df(f"SELECT MAX(ts) m FROM telemetry WHERE astronaut_id=?{clause}", (aid, *p))["m"][0]
+    if end_at is None:
+        end = read_df(f"SELECT MAX(ts) m FROM telemetry WHERE astronaut_id=?{clause}", (aid, *p))["m"][0]
+    else:
+        end = pd.Timestamp(end_at).strftime(FMT)
+        latest = read_df(
+            f"SELECT MAX(ts) m FROM telemetry WHERE astronaut_id=? AND ts<=?{clause}",
+            (aid, end, *p),
+        )["m"][0]
+        end = latest
     if end is None or pd.isna(end):
         return pd.DataFrame()
     start = (pd.Timestamp(end) - delta).strftime(FMT)
@@ -714,7 +722,19 @@ def mission_view(aid: str, source: str, range_label: str):
     # ---- D. telemetry charts
     st.markdown(f'<div class="sec">REAL-TIME TELEMETRY — {html.escape(aid)} — {range_label.upper()} '
                 f'(ending at latest reading)</div>', unsafe_allow_html=True)
-    d = load_window(aid, source, LIVE_RANGES.get(range_label, RANGES[range_label]))
+    replay = st.session_state.get("csv_replay")
+    replay_time = (
+        replay.current_timestamp
+        if replay is not None and replay.current_timestamp
+        and replay.status in {"RUNNING", "PAUSED", "COMPLETED"}
+        else None
+    )
+    d = load_window(
+        aid, source, LIVE_RANGES.get(range_label, RANGES[range_label]),
+        end_at=replay_time,
+    )
+    if replay_time:
+        st.caption(f"CSV replay chart cursor: {replay_time} UTC · charts reveal readings up to this timestamp")
     stats = baseline_stats(aid, source)
     if d.empty:
         st.info("No readings for this selection.")
