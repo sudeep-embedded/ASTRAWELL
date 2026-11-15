@@ -1,85 +1,37 @@
-"""Explainable rule engine — implementation comes later."""
+"""Explainable, per-astronaut multi-indicator rule engine."""
+import pandas as pd
+
 
 def evaluate_health_patterns(anomaly_results):
-
     alerts = []
+    if anomaly_results is None or anomaly_results.empty:
+        return alerts
+    abnormal = anomaly_results[anomaly_results["anomaly"].fillna(False).astype(bool)]
+    if abnormal.empty:
+        return alerts
 
-    # Extract detected anomalies
-    abnormal = anomaly_results[
-        anomaly_results["anomaly"] == True
+    rules = [
+        ("HEART_RATE_DEVIATION", {"heart_rate"}, "attention",
+         "Heart rate differs significantly from the astronaut's personal baseline."),
+        ("SPO2_DEVIATION", {"spo2"}, "attention",
+         "Oxygen saturation differs significantly from the astronaut's personal baseline."),
+        ("TEMPERATURE_DEVIATION", {"temperature"}, "attention",
+         "Body temperature differs significantly from the astronaut's personal baseline."),
+        ("SLEEP_FATIGUE_PATTERN", {"sleep_duration", "fatigue"}, "attention",
+         "Unusual sleep duration and fatigue changes were detected together."),
     ]
-
-    indicators = set(abnormal["indicator"])
-
-    # Rule 1: Heart rate deviation
-    if "heart_rate" in indicators:
-
-        alerts.append({
-            "rule": "HEART_RATE_DEVIATION",
-            "priority": "attention",
-            "indicators": ["heart_rate"],
-            "explanation": (
-                "Heart rate differs significantly "
-                "from the astronaut's personal baseline."
-            )
-        })
-
-    # Rule 2: Oxygen saturation deviation
-    if "spo2" in indicators:
-
-        alerts.append({
-            "rule": "SPO2_DEVIATION",
-            "priority": "attention",
-            "indicators": ["spo2"],
-            "explanation": (
-                "Blood oxygen saturation differs "
-                "significantly from the personal baseline."
-            )
-        })
-
-    # Rule 3: Temperature deviation
-    if "temperature" in indicators:
-
-        alerts.append({
-            "rule": "TEMPERATURE_DEVIATION",
-            "priority": "attention",
-            "indicators": ["temperature"],
-            "explanation": (
-                "Body temperature differs significantly "
-                "from the personal baseline."
-            )
-        })
-
-    # Rule 4: Sleep and fatigue combination
-    if (
-        "sleep_duration" in indicators
-        and "fatigue" in indicators
-    ):
-
-        alerts.append({
-            "rule": "SLEEP_FATIGUE_PATTERN",
-            "priority": "attention",
-            "indicators": [
-                "sleep_duration",
-                "fatigue"
-            ],
-            "explanation": (
-                "Unusual sleep duration and fatigue "
-                "changes were detected together."
-            )
-        })
-
-    # Rule 5: Multiple indicator deviations
-    if len(indicators) >= 3:
-
-        alerts.append({
-            "rule": "MULTI_INDICATOR_DEVIATION",
-            "priority": "review",
-            "indicators": sorted(indicators),
-            "explanation": (
-                "Multiple health indicators differ "
-                "from the astronaut's personal baseline."
-            )
-        })
-
+    for aid, crew_rows in abnormal.groupby("astronaut_id", dropna=False):
+        indicators = set(crew_rows["indicator"].astype(str))
+        for name, required, priority, explanation in rules:
+            if required.issubset(indicators):
+                alerts.append({
+                    "astronaut_id": aid, "rule": name, "priority": priority,
+                    "indicators": sorted(required), "explanation": explanation,
+                })
+        if len(indicators) >= 3:
+            alerts.append({
+                "astronaut_id": aid, "rule": "MULTI_INDICATOR_DEVIATION",
+                "priority": "review", "indicators": sorted(indicators),
+                "explanation": "Multiple health indicators differ from the astronaut's personal baseline.",
+            })
     return alerts
