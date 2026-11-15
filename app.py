@@ -29,6 +29,7 @@ from analytics.anomaly_detector import detect_anomalies
 from analytics.rule_engine import evaluate_health_patterns
 from analytics.mission_analytics import (period_summary, crew_comparison, deterioration_comparison, indicator_correlations, trend_projection, build_report, report_pdf)
 from preprocessing.validator import validate_health_data
+from ingestion.telemetry_csv import prepare_telemetry_csv
 from preprocessing.normalizer import normalize_health_data
 from decision_support.alert_generator import generate_alerts
 from decision_support.explanations import explain_alert
@@ -220,7 +221,7 @@ def to_long(df: pd.DataFrame) -> pd.DataFrame:
                    var_name="indicator", value_name="value").dropna(subset=["value"]))
 
 
-def import_long_frame(df: pd.DataFrame, label="CSV"):
+def import_long_frame(df: pd.DataFrame, label="CSV", source="csv_import"):
     """Mirror a normalised long-format DataFrame into the telemetry table (source='csv_import')."""
     wide = df.pivot_table(index=["astronaut_id", "timestamp"], columns="indicator",
                           values="value", aggfunc="mean").reset_index()
@@ -229,7 +230,7 @@ def import_long_frame(df: pd.DataFrame, label="CSV"):
             wide[c] = np.nan
     wide["ts"] = pd.to_datetime(wide["timestamp"], utc=True, errors="coerce").dt.strftime(FMT)
     wide = wide.dropna(subset=["ts"])
-    rows = [(str(r["astronaut_id"]), r["ts"], "csv_import",
+    rows = [(str(r["astronaut_id"]), r["ts"], source,
              *[None if pd.isna(r[c]) else float(r[c]) for c in INDICATORS])
             for r in wide.to_dict("records")]
     inserted = insert_telemetry(rows)
@@ -402,17 +403,22 @@ def get_ingestor() -> Ingestor:
 
 
 def src_clause(source):
-    return (" AND source=?", (source,)) if source != "all" else ("", ())
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def list_astronauts(source: str = "all") -> list[str]:
-    if source == "simulated":
-        return CREW.copy()
+    if source == "all":
+        return "", ()
     if source == "csv_import":
-        return read_df("SELECT DISTINCT astronaut_id FROM telemetry WHERE source=? ORDER BY 1",
-                       (source,))["astronaut_id"].tolist()
-    return read_df("SELECT DISTINCT astronaut_id FROM telemetry ORDER BY 1")["astronaut_id"].tolist()
+        return " AND source IN ('csv_import','csv_historical','csv_new')", ()
+    if source == "csv_history":
+        return " AND source IN ('csv_import','csv_historical')", ()
+    return " AND source=?", (source,)
+
+
+def list_astronauts(source: str = "all") -> list[str]:
+    """Read current IDs from SQLite so imports cannot leave stale selector options."""
+    clause, params = src_clause(source)
+    return read_df(
+        f"SELECT DISTINCT astronaut_id FROM telemetry WHERE 1=1{clause} ORDER BY astronaut_id",
+        params,
+    )["astronaut_id"].dropna().astype(str).tolist()
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -424,7 +430,14 @@ def total_readings() -> int:
 def baseline_stats(aid, source) -> dict:
     """Personal baseline (mean, std) per indicator, aggregated in SQL (no full-history load)."""
     cols = ",".join(f"AVG({c}) m_{c}, AVG({c}*{c}) q_{c}, COUNT({c}) n_{c}" for c in INDICATORS)
-    clause, p = src_clause(source)
+    baseline_source = source
+    if source == "csv_import":
+        historical_n = read_df(
+            "SELECT COUNT(*) n FROM telemetry WHERE astronaut_id=? AND source IN ('csv_historical','csv_import')",
+            (aid,),
+        )["n"].iloc[0]
+        baseline_source = "csv_history" if historical_n else "csv_new"
+    clause, p = src_clause(baseline_source)
     row = read_df(f"SELECT {cols} FROM telemetry WHERE astronaut_id=?{clause}", (aid, *p)).iloc[0]
     out = {}
     for c, (_, _, _, floor) in INDICATORS.items():
@@ -473,7 +486,7 @@ def sev_color(s) -> str:
 
 def crew_snapshot(source):
     out = []
-    for a in list_astronauts():
+    for a in list_astronauts(source):
         vals, last = latest_snapshot(a, source)
         stats = baseline_stats(a, source)
         z = {c: (vals[c] - stats[c][0]) / stats[c][1]
@@ -694,8 +707,14 @@ def mission_view(aid: str, source: str, range_label: str):
 
     # ---- F. alert centre
     st.markdown('<div class="sec">ACTIVE ALERT CENTRE</div>', unsafe_allow_html=True)
-    alerts = read_df("SELECT * FROM live_alerts ORDER BY (status='UNACKNOWLEDGED') DESC, "
-                     "detected_at DESC LIMIT 15")
+    if source == "all":
+        alerts = read_df("SELECT * FROM live_alerts ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
+    elif source == "csv_import":
+        alerts = read_df("SELECT * FROM live_alerts WHERE source IN ('csv_import','csv_historical','csv_new') "
+                         "ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
+    else:
+        alerts = read_df("SELECT * FROM live_alerts WHERE source=? ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15",
+                         (source,))
     if alerts.empty:
         st.success("No alerts generated.")
     for r in alerts.to_dict("records"):
@@ -746,63 +765,82 @@ def provisional_baseline(astronaut_ids):
     return pd.DataFrame(rows)
 
 
+def _read_validated_upload(upload, label):
+    raw = upload.getvalue()
+    raw_frame = pd.read_csv(io.BytesIO(raw))
+    try:
+        canonical = prepare_telemetry_csv(raw_frame)
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}") from exc
+    validation = validate_health_data(canonical)
+    if not validation["valid"]:
+        raise ValueError(f"{label}: " + "; ".join(map(str, validation["errors"][:20])))
+    normalised = normalize_health_data(canonical)
+    normalised["timestamp"] = pd.to_datetime(normalised["timestamp"], utc=True, errors="coerce")
+    normalised["astronaut_id"] = normalised["astronaut_id"].astype(str).str.strip()
+    normalised = normalised.dropna(subset=["astronaut_id", "timestamp", "value"])
+    if normalised.empty:
+        raise ValueError(f"{label}: no valid telemetry rows remain after parsing.")
+    return raw, normalised
+
+
+def provisional_baseline(astronaut_ids):
+    """Engineering reference values only; not clinical thresholds or diagnosis."""
+    references = {
+        "heart_rate": (75.0, 15.0), "spo2": (97.0, 1.5),
+        "temperature": (36.8, 0.4), "sleep_duration": (7.0, 1.5),
+        "fatigue": (2.0, 1.0),
+    }
+    rows = []
+    for aid in sorted(set(astronaut_ids)):
+        for indicator, (mean, std) in references.items():
+            rows.append({"astronaut_id": aid, "indicator": indicator, "mean": mean,
+                         "std": std, "minimum": float("nan"), "maximum": float("nan"), "count": 2})
+    return pd.DataFrame(rows)
+
+
 def run_csv_analysis(hf, nf):
-    """Analyse historical-only, new-only, or historical + new long-format CSV uploads."""
+    """Analyse historical-only, new-only, or combined long-/wide-format CSV uploads."""
     if hf is None and nf is None:
-        return None, ["Upload at least one CSV: historical data, new readings, or both."]
-    raw_h = hf.getvalue() if hf is not None else b""
-    raw_n = nf.getvalue() if nf is not None else b""
-    historical = None
-    new = None
-
-    if hf is not None:
-        h_raw = pd.read_csv(io.BytesIO(raw_h))
-        v = validate_health_data(h_raw)
-        if not v["valid"]:
-            return None, ["Historical dataset validation failed:"] + [str(e) for e in v["errors"]]
-        historical = normalize_health_data(h_raw)
-
-    if nf is not None:
-        n_raw = pd.read_csv(io.BytesIO(raw_n))
-        v = validate_health_data(n_raw)
-        if not v["valid"]:
-            return None, ["New readings validation failed:"] + [str(e) for e in v["errors"]]
-        new = normalize_health_data(n_raw)
-
-    if historical is not None:
-        baseline = calculate_baseline(historical)
-        baseline_source = "Uploaded historical dataset"
-    else:
-        baseline = provisional_baseline(new["astronaut_id"].unique())
-        baseline_source = "Provisional reference ranges (no historical dataset uploaded)"
-
-    anomalies, alerts, expl = pd.DataFrame(), [], []
-    if new is not None:
-        anomalies = detect_anomalies(new, baseline)
-        alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
-        expl = [explain_alert(a) for a in alerts]
-
-    if historical is not None:
-        import_long_frame(historical, f"Historical CSV '{hf.name}'")
-    if new is not None:
-        import_long_frame(new, f"New readings CSV '{nf.name}'")
-
-    upload_hash = hashlib.sha256(raw_h + b"::" + raw_n).hexdigest()
-    if register_import(upload_hash, hf.name if hf is not None else nf.name):
+        return None, ["Upload historical data, new readings, or both."]
+    try:
+        raw_h, historical = _read_validated_upload(hf, "Historical dataset") if hf is not None else (b"", None)
+        raw_n, new = _read_validated_upload(nf, "New readings dataset") if nf is not None else (b"", None)
         if historical is not None:
-            save_health_readings(historical)
-            save_baselines(calculate_baseline(historical))
-        if new is not None:
-            save_alerts(alerts)
+            baseline = calculate_baseline(historical)
+            baseline_source = "Uploaded historical dataset"
+        else:
+            baseline = provisional_baseline(new["astronaut_id"].unique())
+            baseline_source = "Provisional engineering references — no historical dataset uploaded"
 
-    reference_time = (str(new["timestamp"].max()) if new is not None
-                      else str(historical["timestamp"].max()))
-    created = ingest_alerts(alerts, "csv_import", "UNKNOWN", reference_time)
-    log_event("ANALYSIS", "—",
-              f"CSV analysis complete ({baseline_source}): {len(alerts)} alert(s), {created} new")
-    return {"baseline": baseline, "baseline_source": baseline_source,
-            "anomalies": anomalies, "alerts": alerts, "explanations": expl,
-            "readings": new if new is not None else historical}, []
+        anomalies, alerts, expl = pd.DataFrame(), [], []
+        if new is not None:
+            anomalies = detect_anomalies(new, baseline)
+            alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
+            expl = [explain_alert(a) for a in alerts]
+
+        if historical is not None:
+            import_long_frame(historical, f"Historical CSV '{hf.name}'", source="csv_historical")
+        if new is not None:
+            import_long_frame(new, f"New readings CSV '{nf.name}'", source="csv_new")
+
+        upload_hash = hashlib.sha256(raw_h + b"::ASTRAWELL::" + raw_n).hexdigest()
+        if register_import(upload_hash, hf.name if hf is not None else nf.name):
+            if historical is not None:
+                save_health_readings(historical)
+                save_baselines(calculate_baseline(historical))
+            if new is not None:
+                save_alerts(alerts)
+        reference_time = (str(new["timestamp"].max()) if new is not None
+                          else str(historical["timestamp"].max()))
+        created = ingest_alerts(alerts, "csv_import", "UNKNOWN", reference_time)
+        log_event("ANALYSIS", "—",
+                  f"CSV analysis complete ({baseline_source}): {len(alerts)} alert(s), {created} new")
+        return {"baseline": baseline, "baseline_source": baseline_source,
+                "anomalies": anomalies, "alerts": alerts, "explanations": expl,
+                "readings": new if new is not None else historical}, []
+    except Exception as exc:
+        return None, [str(exc)]
 
 # ============================== APP ==============================
 
@@ -827,12 +865,10 @@ with st.sidebar:
     st.divider()
     st.markdown("### VIEW")
     source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]
-    ids = (CREW if source_key == "simulated" else
-           read_df("SELECT DISTINCT astronaut_id FROM telemetry WHERE source=? ORDER BY 1",
-                   ("csv_import",))["astronaut_id"].tolist() if source_key == "csv_import" else list_astronauts())
+    ids = list_astronauts(source_key)
     monitor_mode = st.radio("Monitoring mode", ["Crew (all astronauts)", "Individual astronaut"],
                             horizontal=False, key="monitor_mode")
-    sel = st.selectbox("Astronaut", ids) if ids else None
+    sel = st.selectbox("Astronaut", ids, key=f"astronaut_selector_{source_key}") if ids else None
     ing.monitor_mode = monitor_mode
     ing.target_astronaut = sel if monitor_mode == "Individual astronaut" else None
     range_label = st.select_slider("Live monitoring window", list(LIVE_RANGES), value="5 minutes")
@@ -848,9 +884,10 @@ with st.sidebar:
                     st.error(e)
             else:
                 st.session_state["analysis"] = res
-                list_astronauts.clear()
                 baseline_stats.clear()
+                total_readings.clear()
                 st.success("Analysis complete; data imported.")
+                st.rerun()
         except Exception as e:
             st.error(f"Analysis failed: {e}")
 
