@@ -459,6 +459,35 @@ def get_ingestor() -> Ingestor:
     init_live_db()
     return Ingestor(SimulatedSource())
 
+
+def reset_live_session(ing: Ingestor):
+    """Reset live telemetry even if Streamlit reuses a pre-update cached Ingestor."""
+    ing.running = False
+    reset_lock = getattr(ing, "reset_lock", None)
+    if reset_lock is None:
+        reset_lock = threading.Lock()
+        ing.reset_lock = reset_lock
+    with reset_lock:
+        with transaction() as conn:
+            deleted_readings = conn.execute(
+                "DELETE FROM telemetry WHERE source='simulated'"
+            ).rowcount
+            deleted_alerts = conn.execute(
+                "DELETE FROM live_alerts WHERE source='simulated'"
+            ).rowcount
+            _event(
+                conn, "IMPORT", "SYSTEM",
+                f"Live session reset: {deleted_readings} simulated reading(s) and "
+                f"{deleted_alerts} simulated alert(s) cleared"
+            )
+    ing.ticks = 0
+    ing.baselines.clear()
+    ing.last_error = ""
+    for aid in CREW:
+        ing.source.s[aid].update(dev=0.0, ep=0, len=1, sleep=PROFILE[aid][3])
+    total_readings.clear()
+    baseline_stats.clear()
+
 # ============================== QUERIES / ANALYTICS ==============================
 
 
@@ -1035,7 +1064,7 @@ with st.sidebar:
     b1, b2, b3 = st.columns(3)
     b1.button("▶ START", on_click=ing.start, disabled=ing.running)
     b2.button("■ STOP", on_click=ing.stop, disabled=not ing.running)
-    b3.button("↺ RESET", on_click=ing.reset)
+    b3.button("↺ RESET", on_click=reset_live_session, args=(ing,))
     interval = st.slider("Telemetry sampling interval (seconds)", 1, 30, int(ing.interval),
                          help="At 1 second, one fresh reading is generated per monitored astronaut every second.")
     ing.interval = float(interval)
