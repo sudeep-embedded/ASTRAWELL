@@ -29,7 +29,7 @@ from analytics.anomaly_detector import detect_anomalies
 from analytics.rule_engine import evaluate_health_patterns
 from analytics.mission_analytics import (period_summary, crew_comparison, deterioration_comparison, indicator_correlations, trend_projection, build_report, report_pdf)
 from preprocessing.validator import validate_health_data
-from ingestion.telemetry_csv import prepare_telemetry_csv
+from ingestion.telemetry_csv import prepare_telemetry_csv, validate_telemetry_chunk
 from ingestion.replay import ReplayController
 from preprocessing.normalizer import normalize_health_data
 from decision_support.alert_generator import generate_alerts
@@ -817,21 +817,7 @@ def _iter_validated_upload(upload, label, chunksize=20000):
         total = 0
         for raw_chunk in chunks:
             canonical = prepare_telemetry_csv(raw_chunk)
-            canonical = normalize_health_data(canonical)
-            canonical["timestamp"] = pd.to_datetime(canonical["timestamp"], utc=True, errors="coerce")
-            canonical["value"] = pd.to_numeric(canonical["value"], errors="coerce")
-            canonical["astronaut_id"] = canonical["astronaut_id"].astype("string").str.strip()
-            canonical["indicator"] = canonical["indicator"].astype("string").str.strip().str.lower()
-            canonical["unit"] = canonical["unit"].astype("string").str.strip()
-            canonical["source"] = canonical["source"].astype("string").str.strip().str.lower()
-            if canonical[["astronaut_id", "timestamp", "indicator", "unit", "source", "value"]].isna().any().any():
-                raise ValueError(f"{label}: missing ID, timestamp, indicator, unit, source, or numeric measurement.")
-            validation = validate_health_data(canonical)
-            if not validation["valid"]:
-                raise ValueError(f"{label}: " + "; ".join(map(str, validation["errors"][:10])))
-            dup = canonical.duplicated(["astronaut_id", "timestamp", "indicator"])
-            if dup.any():
-                raise ValueError(f"{label}: {int(dup.sum())} duplicate astronaut/timestamp/indicator rows in a CSV chunk.")
+            canonical = validate_telemetry_chunk(canonical, label)
             total += len(canonical)
             yield canonical
         if total == 0:
@@ -890,7 +876,13 @@ def run_csv_analysis(hf, nf):
         if nf is not None:
             for chunk in _iter_validated_upload(nf, "New readings dataset"):
                 new_ids.update(chunk["astronaut_id"].astype(str).unique())
-                active_baseline = baseline if baseline is not None else provisional_baseline(chunk["astronaut_id"].unique())
+                if baseline is None:
+                    active_baseline = provisional_baseline(chunk["astronaut_id"].unique())
+                else:
+                    known_ids = set(baseline["astronaut_id"].astype(str))
+                    missing_ids = set(chunk["astronaut_id"].astype(str)) - known_ids
+                    fallback = provisional_baseline(missing_ids) if missing_ids else pd.DataFrame()
+                    active_baseline = pd.concat([baseline, fallback], ignore_index=True)
                 anomalies = detect_anomalies(chunk, active_baseline)
                 if not anomalies.empty:
                     if len(anomaly_samples) < 10000:
