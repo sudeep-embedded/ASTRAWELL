@@ -55,9 +55,18 @@ RANGES = {"1 hour": timedelta(hours=1), "6 hours": timedelta(hours=6),
           "24 hours": timedelta(hours=24), "7 days": timedelta(days=7),
           "30 days": timedelta(days=30)}
 SOURCES = {"All sources": "all", "Simulated": "simulated", "CSV import": "csv_import"}
-CREW = ["SIM-01", "SIM-02", "SIM-03", "SIM-04"]
-PROFILE = {"SIM-01": (64, 98.0, 36.6, 7.2), "SIM-02": (70, 97.5, 36.7, 6.8),
-           "SIM-03": (60, 98.5, 36.5, 7.5), "SIM-04": (74, 97.0, 36.8, 6.5)}
+# Thirty deterministic synthetic crew profiles. Values are illustrative baselines,
+# not measurements or medically validated limits.
+CREW = [f"SIM-{i:02d}" for i in range(1, 31)]
+PROFILE = {
+    aid: (
+        60 + ((i * 7) % 19),                 # resting HR baseline: 60–78 bpm
+        round(96.5 + ((i * 13) % 25) / 10, 1),  # SpO2 baseline: 96.5–98.9%
+        round(36.4 + ((i * 11) % 7) / 10, 2),   # temperature: 36.4–37.0 C
+        round(6.2 + ((i * 17) % 19) / 10, 1),   # sleep: 6.2–8.0 h
+    )
+    for i, aid in enumerate(CREW, start=1)
+}
 KIND_COLOR = {"TELEMETRY": CYAN, "ANOMALY": AMBER, "ALERT": RED,
               "IMPORT": BLUE, "ANALYSIS": GREEN}
 
