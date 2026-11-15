@@ -328,6 +328,7 @@ class Ingestor:
 
     def __init__(self, source: TelemetrySource):
         self.source, self.interval, self.running = source, 1.0, False
+        self.reset_lock = threading.Lock()
         self.monitor_mode, self.target_astronaut = "Crew (all astronauts)", None
         self.ticks, self.baselines, self.last_error = 0, {}, ""
         if source.name == "simulated":
@@ -375,11 +376,37 @@ class Ingestor:
             self.running = False
             log_event("TELEMETRY", "SYSTEM", "Monitoring stopped")
 
+    def reset(self):
+        """Stop monitoring and clear the simulated live-session readings and alerts."""
+        self.running = False
+        with self.reset_lock:
+            with transaction() as conn:
+                deleted_readings = conn.execute(
+                    "DELETE FROM telemetry WHERE source='simulated'"
+                ).rowcount
+                deleted_alerts = conn.execute(
+                    "DELETE FROM live_alerts WHERE source='simulated'"
+                ).rowcount
+                _event(
+                    conn, "IMPORT", "SYSTEM",
+                    f"Live session reset: {deleted_readings} simulated reading(s) and "
+                    f"{deleted_alerts} simulated alert(s) cleared"
+                )
+        self.ticks = 0
+        self.baselines.clear()
+        self.last_error = ""
+        for aid in CREW:
+            self.source.s[aid].update(dev=0.0, ep=0, len=1, sleep=PROFILE[aid][3])
+        total_readings.clear()
+        baseline_stats.clear()
+
     def _loop(self):
         while True:
             if self.running:
                 try:
-                    self._tick()
+                    with self.reset_lock:
+                        if self.running:
+                            self._tick()
                 except Exception as e:  # never kill the thread
                     self._report(f"Ingest error: {e}")
                 time.sleep(max(0.5, self.interval))
@@ -1005,9 +1032,10 @@ with st.sidebar:
     st.caption("ASTRAWELL HEALTH INTELLIGENCE")
     st.markdown("### LIVE MONITORING")
     st.caption("⚠ Simulated telemetry. Start/Stop and interval apply to ALL open sessions.")
-    b1, b2 = st.columns(2)
+    b1, b2, b3 = st.columns(3)
     b1.button("▶ START", on_click=ing.start, disabled=ing.running)
     b2.button("■ STOP", on_click=ing.stop, disabled=not ing.running)
+    b3.button("↺ RESET", on_click=ing.reset)
     interval = st.slider("Telemetry sampling interval (seconds)", 1, 30, int(ing.interval),
                          help="At 1 second, one fresh reading is generated per monitored astronaut every second.")
     ing.interval = float(interval)
