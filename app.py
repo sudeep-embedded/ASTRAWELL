@@ -407,6 +407,8 @@ def src_clause(source):
         return "", ()
     if source == "csv_import":
         return " AND source IN ('csv_import','csv_historical','csv_new')", ()
+    if source == "csv_history":
+        return " AND source IN ('csv_import','csv_historical')", ()
     return " AND source=?", (source,)
 
 
@@ -434,7 +436,7 @@ def baseline_stats(aid, source) -> dict:
             "SELECT COUNT(*) n FROM telemetry WHERE astronaut_id=? AND source IN ('csv_historical','csv_import')",
             (aid,),
         )["n"].iloc[0]
-        baseline_source = "csv_historical" if historical_n else "csv_new"
+        baseline_source = "csv_history" if historical_n else "csv_new"
     clause, p = src_clause(baseline_source)
     row = read_df(f"SELECT {cols} FROM telemetry WHERE astronaut_id=?{clause}", (aid, *p)).iloc[0]
     out = {}
