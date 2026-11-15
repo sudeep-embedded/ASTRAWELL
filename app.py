@@ -407,7 +407,7 @@ def src_clause(source):
     if source == "all":
         return "", ()
     if source == "csv_import":
-        return " AND source IN ('csv_import','csv_historical','csv_new')", ()
+        return " AND source IN ('csv_import','csv_historical','csv_new','csv_replay')", ()
     if source == "csv_history":
         return " AND source IN ('csv_import','csv_historical')", ()
     return " AND source=?", (source,)
@@ -711,7 +711,7 @@ def mission_view(aid: str, source: str, range_label: str):
     if source == "all":
         alerts = read_df("SELECT * FROM live_alerts ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
     elif source == "csv_import":
-        alerts = read_df("SELECT * FROM live_alerts WHERE source IN ('csv_import','csv_historical','csv_new') "
+        alerts = read_df("SELECT * FROM live_alerts WHERE source IN ('csv_import','csv_historical','csv_new','csv_replay') "
                          "ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
     else:
         alerts = read_df("SELECT * FROM live_alerts WHERE source=? ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15",
