@@ -949,12 +949,15 @@ with st.sidebar:
         rc3, rc4 = st.columns(2)
         rc3.button("■ STOP", key="csv_replay_stop", on_click=replay.stop)
         rc4.button("↺ RESET", key="csv_replay_reset", on_click=replay.reset)
-        st.caption(f"Replay: {replay.status} · {replay.index:,}/{len(replay.timestamps):,} timestamps")
-        st.progress(replay.progress)
-        if replay.current_timestamp:
-            st.caption(f"Source timestamp: {replay.current_timestamp} UTC")
-        if replay.last_error:
-            st.error(replay.last_error)
+        @st.fragment(run_every="1s")
+        def _render_replay_status(controller):
+            st.caption(f"Replay: {controller.status} · {controller.index:,}/{len(controller.timestamps):,} timestamps")
+            st.progress(controller.progress)
+            if controller.current_timestamp:
+                st.caption(f"Source timestamp: {controller.current_timestamp} UTC")
+            if controller.last_error:
+                st.error(controller.last_error)
+        _render_replay_status(replay)
 
     st.divider()
     st.markdown("### VIEW")
