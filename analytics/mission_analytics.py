@@ -199,3 +199,79 @@ def report_pdf(report: dict, title: str = "ASTRAWELL Health Intelligence Report"
         "medical procedures or professional judgement.", styles["Italic"]))
     doc.build(story)
     return output.getvalue()
+
+
+def deterioration_comparison(frame: pd.DataFrame, min_days: int = 6) -> pd.DataFrame:
+    """Rank relative deterioration from the first to last third of each astronaut's timeline.
+
+    Direction is explicit: rising HR/temperature/fatigue and falling SpO2/sleep
+    count as adverse movement. Changes are scaled by each indicator's early-period
+    variability (with conservative floors). This is an experimental trend index,
+    not a clinical severity or medical-risk score.
+    """
+    d = _clean(frame)
+    if "astronaut_id" not in d or d.empty:
+        return pd.DataFrame()
+    directions = {
+        "heart_rate": 1.0, "spo2": -1.0, "temperature": 1.0,
+        "sleep_duration": -1.0, "fatigue": 1.0,
+    }
+    floors = {
+        "heart_rate": 2.0, "spo2": 0.4, "temperature": 0.12,
+        "sleep_duration": 0.5, "fatigue": 0.5,
+    }
+    rows = []
+    for aid, group in d.groupby("astronaut_id"):
+        group = group.sort_values("ts").copy()
+        days = group["ts"].dt.floor("D").nunique()
+        if days < min_days:
+            continue
+        start, end = group["ts"].min(), group["ts"].max()
+        span = end - start
+        if span <= pd.Timedelta(0):
+            continue
+        cut1, cut2 = start + span / 3, start + span * 2 / 3
+        early = group[group["ts"] <= cut1]
+        late = group[group["ts"] >= cut2]
+        indicator_scores = []
+        drivers = []
+        detail = {}
+        for col, direction in directions.items():
+            if col not in group:
+                continue
+            a = pd.to_numeric(early[col], errors="coerce").dropna()
+            b = pd.to_numeric(late[col], errors="coerce").dropna()
+            if len(a) < 3 or len(b) < 3:
+                continue
+            base = float(a.mean())
+            recent = float(b.mean())
+            scale = max(float(a.std(ddof=1)) if len(a) > 1 else 0.0, floors[col])
+            signed_change = direction * (recent - base) / scale
+            # Clamp each contribution so one noisy channel cannot dominate the crew ranking.
+            score = float(np.clip(signed_change, -5.0, 5.0))
+            indicator_scores.append(score)
+            detail[col] = {"early_mean": base, "late_mean": recent,
+                           "adverse_change_sigma": score}
+            if score >= 0.5:
+                drivers.append(f"{col} ({score:+.1f}σ adverse)")
+        if not indicator_scores:
+            continue
+        positive = [max(0.0, x) for x in indicator_scores]
+        composite = float(np.mean(positive))
+        rows.append({
+            "Astronaut": aid,
+            "Deterioration index (experimental)": round(composite, 2),
+            "Indicators worsening": sum(x >= 0.5 for x in indicator_scores),
+            "Indicators assessed": len(indicator_scores),
+            "Main drivers": "; ".join(drivers) if drivers else "No clear adverse shift",
+            "Window days": int(days),
+            "_details": detail,
+        })
+    if not rows:
+        return pd.DataFrame()
+    result = pd.DataFrame(rows).sort_values(
+        ["Deterioration index (experimental)", "Indicators worsening"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+    result.insert(0, "Rank", np.arange(1, len(result) + 1))
+    return result
