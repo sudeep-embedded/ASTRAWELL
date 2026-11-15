@@ -1068,8 +1068,14 @@ tab_mc, tab_data, tab_analytics, tab_sys = st.tabs(["MISSION CONTROL", "DATA & A
 with tab_mc:
     if sel is None:
         st.info("No data yet — press START to begin simulated monitoring or import CSV data.")
-    # run_every is fixed at decoration time; widget changes trigger a full rerun that rebuilds it
-    st.fragment(run_every=f"{interval}s")(mission_view)(sel or "", source_key, range_label) if sel else None
+    # Refresh the chart fragment at the replay cadence so it can follow the replay cursor.
+    # Outside active CSV playback, preserve the user's normal telemetry refresh interval.
+    replay_for_refresh = st.session_state.get("csv_replay")
+    if replay_for_refresh is not None and replay_for_refresh.status == "RUNNING":
+        chart_refresh_seconds = max(0.2, 1.0 / max(replay_for_refresh.speed, 0.01))
+    else:
+        chart_refresh_seconds = float(interval)
+    st.fragment(run_every=chart_refresh_seconds)(mission_view)(sel or "", source_key, range_label) if sel else None
 
 with tab_data:
     st.markdown("## CSV ANALYSIS RESULTS")
