@@ -837,7 +837,7 @@ with tab_analytics:
             st.caption("Largest deviation is the maximum absolute z-score across available indicators. It is a statistical ranking, not a medical risk score.")
 
         st.markdown("### MULTI-INDICATOR CORRELATION")
-        corr = correlation_matrix(combined)
+        corr = correlation_matrix(selected_readings)
         if corr.empty:
             st.info("Not enough overlapping telemetry to calculate correlations.")
         else:
