@@ -29,7 +29,39 @@ from analytics.anomaly_detector import detect_anomalies
 from analytics.rule_engine import evaluate_health_patterns
 from analytics.mission_analytics import (period_summary, crew_comparison, deterioration_comparison, indicator_correlations, trend_projection, build_report, report_pdf)
 from preprocessing.validator import validate_health_data
-from ingestion.telemetry_csv import prepare_telemetry_csv, validate_telemetry_chunk
+from ingestion.telemetry_csv import prepare_telemetry_csv
+try:
+    from ingestion.telemetry_csv import validate_telemetry_chunk
+except ImportError:
+    # Compatibility fallback for deployments serving an older telemetry_csv.py.
+    def validate_telemetry_chunk(frame: pd.DataFrame, label: str = "CSV") -> pd.DataFrame:
+        required = ["astronaut_id", "timestamp", "indicator", "value", "unit", "source"]
+        missing = [column for column in required if column not in frame.columns]
+        if missing:
+            raise ValueError(f"{label}: missing required columns: {missing}")
+        data = frame.copy()
+        for column in ("astronaut_id", "indicator", "unit", "source"):
+            data[column] = data[column].astype("string").str.strip()
+        data["indicator"] = data["indicator"].str.lower()
+        data["source"] = data["source"].str.lower()
+        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True, errors="coerce")
+        data["value"] = pd.to_numeric(data["value"], errors="coerce")
+        if data[required].isna().any(axis=None):
+            raise ValueError(f"{label}: missing or invalid required values.")
+        limits = {
+            "heart_rate": ("bpm", 1, 250), "spo2": ("percent", 0, 100),
+            "temperature": ("C", 25, 45), "sleep_duration": ("hours", 0, 24),
+            "fatigue": ("score", 1, 5),
+        }
+        for indicator, (unit, low, high) in limits.items():
+            mask = data["indicator"].eq(indicator)
+            if (mask & data["unit"].ne(unit)).any():
+                raise ValueError(f"{label}: {indicator} requires unit '{unit}'.")
+            if (mask & ~data["value"].between(low, high)).any():
+                raise ValueError(f"{label}: {indicator} value is outside {low}–{high}.")
+        if data.duplicated(["astronaut_id", "timestamp", "indicator"]).any():
+            raise ValueError(f"{label}: duplicate astronaut/timestamp/indicator rows.")
+        return data.reset_index(drop=True)
 from ingestion.replay import ReplayController
 from preprocessing.normalizer import normalize_health_data
 from decision_support.alert_generator import generate_alerts
