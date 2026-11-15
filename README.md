@@ -42,8 +42,17 @@ python -m pytest -q
 ```
 
 ## CSV schema
-The normalized long-format CSV requires these columns:
+ASTRAWELL accepts either of these input layouts:
+
+**Long format**
 `astronaut_id,timestamp,indicator,value,unit,source`
+
+**Wide format**
+`astronaut_id,timestamp,heart_rate_bpm,spo2_percent,temperature_C,sleep_duration_hours,fatigue_score`
+
+For wide files, `source` is optional. The importer converts each populated measurement column into the canonical long format. Partial wide files are accepted when they contain at least one supported measurement column.
+
+Upload a historical baseline file, a new-readings file, or both. If only new readings are supplied, the application labels the comparison reference as provisional; it is not a personalized historical baseline. When both files are supplied, the new readings are compared with the historical baseline only.
 
 Supported indicators and units:
 - `heart_rate` — `bpm`
@@ -51,6 +60,10 @@ Supported indicators and units:
 - `temperature` — `C`
 - `sleep_duration` — `hours`
 - `fatigue` — `score`
+
+The astronaut selector is populated from distinct IDs currently stored for the selected data source, rather than a fixed crew count. Imported historical and new-reading records are stored separately so historical baselines can be preferred during dashboard comparison.
+
+**Current limitation:** uploaded CSV files are imported and analysed, but timestamp-paced Start/Pause/Resume/Stop/Reset CSV replay is not yet implemented. The live sampling slider controls synthetic telemetry generation and dashboard refresh, not uploaded-file playback.
 
 Input validation bounds are data-quality checks, not medical safety limits.
 
