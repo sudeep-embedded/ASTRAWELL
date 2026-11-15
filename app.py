@@ -292,12 +292,24 @@ class Ingestor:
     def __init__(self, source: TelemetrySource):
         self.source, self.interval, self.running = source, 3.0, False
         self.ticks, self.baselines, self.last_error = 0, {}, ""
-        n = read_df("SELECT COUNT(*) n FROM telemetry WHERE source=?", (source.name,))["n"][0]
-        if n == 0:
-            rows = source.seed()
-            if rows:
-                insert_telemetry(rows)
-                log_event("IMPORT", "SYSTEM", f"Seeded {len(rows)} {source.name} history rows (30 days)")
+        if source.name == "simulated":
+            existing = set(read_df(
+                "SELECT DISTINCT astronaut_id FROM telemetry WHERE source=?", (source.name,)
+            )["astronaut_id"].tolist())
+            missing = set(CREW) - existing
+            if missing:
+                rows = [row for row in source.seed() if row[0] in missing]
+                if rows:
+                    insert_telemetry(rows)
+                    log_event("IMPORT", "SYSTEM",
+                              f"Seeded {len(rows)} history rows for {len(missing)} new simulated crew profiles")
+        else:
+            n = read_df("SELECT COUNT(*) n FROM telemetry WHERE source=?", (source.name,))["n"][0]
+            if n == 0:
+                rows = source.seed()
+                if rows:
+                    insert_telemetry(rows)
+                    log_event("IMPORT", "SYSTEM", f"Seeded {len(rows)} {source.name} history rows (30 days)")
         self.thread = threading.Thread(target=self._loop, daemon=True, name="astrawell-ingest")
         self.thread.start()
 
