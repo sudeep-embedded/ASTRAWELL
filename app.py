@@ -331,7 +331,7 @@ class Ingestor:
                 self.ticks = 0
                 for aid in CREW:
                     self.source.s[aid].update(dev=0.0, ep=0, len=1, sleep=PROFILE[aid][3])
-                list_astronauts.clear()
+                # list_astronauts is uncached; no selector cache needs invalidation.
                 total_readings.clear()
                 baseline_stats.clear()
             self.running = True
