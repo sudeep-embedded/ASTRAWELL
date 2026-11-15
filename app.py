@@ -729,42 +729,79 @@ def mission_view(aid: str, source: str, range_label: str):
 # ============================== CSV ANALYSIS (existing workflow, preserved) ==============================
 
 
-def run_csv_analysis(hf, nf):
-    raw_h = hf.getvalue()
-    raw_n = nf.getvalue() if nf is not None else b""
-    h_raw = pd.read_csv(io.BytesIO(raw_h))
-    v = validate_health_data(h_raw)
-    if not v["valid"]:
-        return None, ["Historical dataset validation failed:"] + [str(e) for e in v["errors"]]
-    historical = normalize_health_data(h_raw)
-    baseline = calculate_baseline(historical)
+def provisional_baseline(astronaut_ids):
+    """Transparent engineering reference baseline used only when no history was uploaded."""
+    references = {
+        "heart_rate": (75.0, 15.0, 1.0, 250.0),
+        "spo2": (97.0, 1.5, 0.0, 100.0),
+        "temperature": (36.8, 0.4, 25.0, 45.0),
+        "sleep_duration": (7.0, 1.5, 0.0, 24.0),
+        "fatigue": (2.0, 1.0, 1.0, 5.0),
+    }
+    rows = []
+    for aid in sorted(set(astronaut_ids)):
+        for indicator, (mean, std, minimum, maximum) in references.items():
+            rows.append({"astronaut_id": aid, "indicator": indicator, "mean": mean,
+                         "std": std, "minimum": minimum, "maximum": maximum, "count": 2})
+    return pd.DataFrame(rows)
 
-    new, anomalies, alerts, expl = None, pd.DataFrame(), [], []
+
+def run_csv_analysis(hf, nf):
+    """Analyse historical-only, new-only, or historical + new long-format CSV uploads."""
+    if hf is None and nf is None:
+        return None, ["Upload at least one CSV: historical data, new readings, or both."]
+    raw_h = hf.getvalue() if hf is not None else b""
+    raw_n = nf.getvalue() if nf is not None else b""
+    historical = None
+    new = None
+
+    if hf is not None:
+        h_raw = pd.read_csv(io.BytesIO(raw_h))
+        v = validate_health_data(h_raw)
+        if not v["valid"]:
+            return None, ["Historical dataset validation failed:"] + [str(e) for e in v["errors"]]
+        historical = normalize_health_data(h_raw)
+
     if nf is not None:
         n_raw = pd.read_csv(io.BytesIO(raw_n))
         v = validate_health_data(n_raw)
         if not v["valid"]:
             return None, ["New readings validation failed:"] + [str(e) for e in v["errors"]]
         new = normalize_health_data(n_raw)
-        if not set(new["astronaut_id"]).issubset(set(baseline["astronaut_id"])):
-            return None, ["New readings contain an astronaut without a historical baseline."]
+
+    if historical is not None:
+        baseline = calculate_baseline(historical)
+        baseline_source = "Uploaded historical dataset"
+    else:
+        baseline = provisional_baseline(new["astronaut_id"].unique())
+        baseline_source = "Provisional reference ranges (no historical dataset uploaded)"
+
+    anomalies, alerts, expl = pd.DataFrame(), [], []
+    if new is not None:
         anomalies = detect_anomalies(new, baseline)
         alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
         expl = [explain_alert(a) for a in alerts]
 
-    import_long_frame(historical, f"Historical CSV '{hf.name}'")
+    if historical is not None:
+        import_long_frame(historical, f"Historical CSV '{hf.name}'")
     if new is not None:
         import_long_frame(new, f"New readings CSV '{nf.name}'")
-    # legacy persistence only once per identical upload (avoids duplicate rows in database/db.py tables)
-    if register_import(hashlib.sha256(raw_h + raw_n).hexdigest(), hf.name):
-        save_health_readings(historical)
-        save_baselines(baseline)
-        if nf is not None:
+
+    upload_hash = hashlib.sha256(raw_h + b"::" + raw_n).hexdigest()
+    if register_import(upload_hash, hf.name if hf is not None else nf.name):
+        if historical is not None:
+            save_health_readings(historical)
+            save_baselines(calculate_baseline(historical))
+        if new is not None:
             save_alerts(alerts)
-    created = ingest_alerts(alerts, "csv_import", "UNKNOWN",
-                            str(new["timestamp"].max()) if new is not None else now_ts())
-    log_event("ANALYSIS", "—", f"CSV analysis complete: {len(alerts)} alert(s), {created} new")
-    return {"baseline": baseline, "anomalies": anomalies, "alerts": alerts, "explanations": expl,
+
+    reference_time = (str(new["timestamp"].max()) if new is not None
+                      else str(historical["timestamp"].max()))
+    created = ingest_alerts(alerts, "csv_import", "UNKNOWN", reference_time)
+    log_event("ANALYSIS", "—",
+              f"CSV analysis complete ({baseline_source}): {len(alerts)} alert(s), {created} new")
+    return {"baseline": baseline, "baseline_source": baseline_source,
+            "anomalies": anomalies, "alerts": alerts, "explanations": expl,
             "readings": new if new is not None else historical}, []
 
 # ============================== APP ==============================
@@ -803,7 +840,7 @@ with st.sidebar:
     st.markdown("### DATA INPUT")
     hist_file = st.file_uploader("Historical baseline CSV", type=["csv"], key="historical")
     new_file = st.file_uploader("New health readings CSV", type=["csv"], key="new_readings")
-    if st.button("ANALYSE HEALTH DATA", disabled=hist_file is None):
+    if st.button("ANALYSE / IMPORT TELEMETRY", disabled=hist_file is None and new_file is None):
         try:
             res, errs = run_csv_analysis(hist_file, new_file)
             if errs:
@@ -829,15 +866,16 @@ with tab_data:
     st.markdown("## CSV ANALYSIS RESULTS")
     res = st.session_state.get("analysis")
     if res is None:
-        st.info("Upload a historical CSV (and optionally new readings) in the sidebar, then press ANALYSE.")
+        st.info("Upload historical data, new readings, or both in the sidebar, then press ANALYSE / IMPORT TELEMETRY.")
     else:
-        st.markdown("### PERSONAL BASELINE")
+        st.markdown("### BASELINE")
+        st.caption(res.get("baseline_source", "Baseline source not recorded"))
         st.dataframe(res["baseline"], hide_index=True)
         st.markdown("### READING COMPARISON")
         if not res["anomalies"].empty:
             st.dataframe(res["anomalies"], hide_index=True)
         else:
-            st.caption("No new readings analysed.")
+            st.caption("No separate new-readings file was uploaded. Historical data was imported for monitoring and analytics.")
         for ex in res["explanations"]:
             with st.expander(f"{str(ex['priority']).upper()} | {ex['alert_id']}"):
                 st.write(ex["summary"])
