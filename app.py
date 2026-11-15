@@ -29,7 +29,8 @@ from analytics.anomaly_detector import detect_anomalies
 from analytics.rule_engine import evaluate_health_patterns
 from analytics.mission_analytics import (period_summary, crew_comparison, deterioration_comparison, indicator_correlations, trend_projection, build_report, report_pdf)
 from preprocessing.validator import validate_health_data
-from ingestion.telemetry_csv import prepare_telemetry_csv
+from ingestion.telemetry_csv import prepare_telemetry_csv, validate_telemetry_chunk
+from ingestion.replay import ReplayController
 from preprocessing.normalizer import normalize_health_data
 from decision_support.alert_generator import generate_alerts
 from decision_support.explanations import explain_alert
@@ -406,7 +407,7 @@ def src_clause(source):
     if source == "all":
         return "", ()
     if source == "csv_import":
-        return " AND source IN ('csv_import','csv_historical','csv_new')", ()
+        return " AND source IN ('csv_import','csv_historical','csv_new','csv_replay')", ()
     if source == "csv_history":
         return " AND source IN ('csv_import','csv_historical')", ()
     return " AND source=?", (source,)
@@ -710,7 +711,7 @@ def mission_view(aid: str, source: str, range_label: str):
     if source == "all":
         alerts = read_df("SELECT * FROM live_alerts ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
     elif source == "csv_import":
-        alerts = read_df("SELECT * FROM live_alerts WHERE source IN ('csv_import','csv_historical','csv_new') "
+        alerts = read_df("SELECT * FROM live_alerts WHERE source IN ('csv_import','csv_historical','csv_new','csv_replay') "
                          "ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15")
     else:
         alerts = read_df("SELECT * FROM live_alerts WHERE source=? ORDER BY (status='UNACKNOWLEDGED') DESC, detected_at DESC LIMIT 15",
@@ -748,6 +749,41 @@ def mission_view(aid: str, source: str, range_label: str):
 # ============================== CSV ANALYSIS (existing workflow, preserved) ==============================
 
 
+
+_REPLAY_BASELINE_CACHE = {}
+
+
+def process_csv_replay_timestamp(timestamp):
+    """Run imported records at one original timestamp through the anomaly/alert pipeline."""
+    rows = read_df(
+        "SELECT * FROM telemetry WHERE ts=? AND source IN ('csv_new','csv_import') ORDER BY astronaut_id",
+        (timestamp,),
+    )
+    for _, row in rows.iterrows():
+        aid = str(row["astronaut_id"])
+        if aid not in _REPLAY_BASELINE_CACHE:
+            history = read_df(
+                "SELECT * FROM telemetry WHERE astronaut_id=? AND source IN ('csv_historical','csv_import') "
+                "ORDER BY ts DESC LIMIT 2000", (aid,),
+            )
+            _REPLAY_BASELINE_CACHE[aid] = (
+                provisional_baseline([aid]) if history.empty else calculate_baseline(to_long(history))
+            )
+        baseline = _REPLAY_BASELINE_CACHE[aid]
+        current = to_long(pd.DataFrame([row]))
+        anomalies = detect_anomalies(current, baseline)
+        alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
+        ingest_alerts(alerts, "csv_replay", aid, timestamp)
+
+
+def create_csv_replay(speed=1.0):
+    _REPLAY_BASELINE_CACHE.clear()
+    timestamps = read_df(
+        "SELECT DISTINCT ts FROM telemetry WHERE source IN ('csv_new','csv_import') ORDER BY ts"
+    )["ts"].astype(str).tolist()
+    return ReplayController(timestamps, process_csv_replay_timestamp, speed=speed)
+
+
 def provisional_baseline(astronaut_ids):
     """Transparent engineering reference baseline used only when no history was uploaded."""
     references = {
@@ -765,80 +801,115 @@ def provisional_baseline(astronaut_ids):
     return pd.DataFrame(rows)
 
 
-def _read_validated_upload(upload, label):
-    raw = upload.getvalue()
-    raw_frame = pd.read_csv(io.BytesIO(raw))
+def _hash_upload(upload):
+    digest = hashlib.sha256()
+    upload.seek(0)
+    while True:
+        block = upload.read(1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    upload.seek(0)
+    return digest.digest()
+
+
+def _iter_validated_upload(upload, label, chunksize=20000):
+    """Read CSV in bounded chunks; wide rows expand to at most five long rows each."""
+    upload.seek(0)
     try:
-        canonical = prepare_telemetry_csv(raw_frame)
-    except ValueError as exc:
-        raise ValueError(f"{label}: {exc}") from exc
-    validation = validate_health_data(canonical)
-    if not validation["valid"]:
-        raise ValueError(f"{label}: " + "; ".join(map(str, validation["errors"][:20])))
-    normalised = normalize_health_data(canonical)
-    normalised["timestamp"] = pd.to_datetime(normalised["timestamp"], utc=True, errors="coerce")
-    normalised["astronaut_id"] = normalised["astronaut_id"].astype(str).str.strip()
-    normalised = normalised.dropna(subset=["astronaut_id", "timestamp", "value"])
-    if normalised.empty:
-        raise ValueError(f"{label}: no valid telemetry rows remain after parsing.")
-    return raw, normalised
+        chunks = pd.read_csv(upload, chunksize=chunksize)
+        total = 0
+        for raw_chunk in chunks:
+            canonical = prepare_telemetry_csv(raw_chunk)
+            canonical = validate_telemetry_chunk(canonical, label)
+            total += len(canonical)
+            yield canonical
+        if total == 0:
+            raise ValueError(f"{label}: the CSV contains no telemetry rows.")
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError(f"{label}: the CSV is empty.") from exc
+    finally:
+        upload.seek(0)
 
 
-def provisional_baseline(astronaut_ids):
-    """Engineering reference values only; not clinical thresholds or diagnosis."""
-    references = {
-        "heart_rate": (75.0, 15.0), "spo2": (97.0, 1.5),
-        "temperature": (36.8, 0.4), "sleep_duration": (7.0, 1.5),
-        "fatigue": (2.0, 1.0),
-    }
+def _baseline_from_aggregates(aggregates):
     rows = []
-    for aid in sorted(set(astronaut_ids)):
-        for indicator, (mean, std) in references.items():
-            rows.append({"astronaut_id": aid, "indicator": indicator, "mean": mean,
-                         "std": std, "minimum": float("nan"), "maximum": float("nan"), "count": 2})
-    return pd.DataFrame(rows)
+    for (aid, indicator), values in aggregates.items():
+        count, total, total_sq, minimum, maximum = values
+        mean = total / count
+        variance = max((total_sq - count * mean * mean) / max(count - 1, 1), 0.0)
+        rows.append({"astronaut_id": aid, "indicator": indicator, "mean": mean,
+                     "std": variance ** 0.5, "minimum": minimum, "maximum": maximum, "count": count})
+    return pd.DataFrame(rows, columns=[
+        "astronaut_id", "indicator", "mean", "std", "minimum", "maximum", "count"
+    ])
 
 
 def run_csv_analysis(hf, nf):
-    """Analyse historical-only, new-only, or combined long-/wide-format CSV uploads."""
+    """Chunked historical/new CSV analysis; memory use is bounded by chunksize."""
     if hf is None and nf is None:
         return None, ["Upload historical data, new readings, or both."]
     try:
-        raw_h, historical = _read_validated_upload(hf, "Historical dataset") if hf is not None else (b"", None)
-        raw_n, new = _read_validated_upload(nf, "New readings dataset") if nf is not None else (b"", None)
-        if historical is not None:
-            baseline = calculate_baseline(historical)
-            baseline_source = "Uploaded historical dataset"
+        hash_h = _hash_upload(hf) if hf is not None else b""
+        hash_n = _hash_upload(nf) if nf is not None else b""
+        aggregates = {}
+        historical_sample = []
+        if hf is not None:
+            for chunk in _iter_validated_upload(hf, "Historical dataset"):
+                for (aid, indicator), group in chunk.groupby(["astronaut_id", "indicator"]):
+                    values = group["value"].astype(float)
+                    key = (str(aid), str(indicator))
+                    current = aggregates.get(key, [0, 0.0, 0.0, float("inf"), float("-inf")])
+                    aggregates[key] = [
+                        current[0] + len(values), current[1] + float(values.sum()),
+                        current[2] + float((values * values).sum()),
+                        min(current[3], float(values.min())), max(current[4], float(values.max()))
+                    ]
+                import_long_frame(chunk, f"Historical CSV '{hf.name}' chunk", source="csv_historical")
+                if len(historical_sample) < 5000:
+                    historical_sample.append(chunk.head(5000 - len(historical_sample)))
+            baseline = _baseline_from_aggregates(aggregates)
+            baseline_source = "Uploaded historical dataset (chunked)"
         else:
-            baseline = provisional_baseline(new["astronaut_id"].unique())
+            baseline = None
             baseline_source = "Provisional engineering references — no historical dataset uploaded"
 
-        anomalies, alerts, expl = pd.DataFrame(), [], []
-        if new is not None:
-            anomalies = detect_anomalies(new, baseline)
-            alerts = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
-            expl = [explain_alert(a) for a in alerts]
+        alerts, explanations, anomaly_samples, new_ids = [], [], [], set()
+        if nf is not None:
+            for chunk in _iter_validated_upload(nf, "New readings dataset"):
+                new_ids.update(chunk["astronaut_id"].astype(str).unique())
+                if baseline is None:
+                    active_baseline = provisional_baseline(chunk["astronaut_id"].unique())
+                else:
+                    known_ids = set(baseline["astronaut_id"].astype(str))
+                    missing_ids = set(chunk["astronaut_id"].astype(str)) - known_ids
+                    fallback = provisional_baseline(missing_ids) if missing_ids else pd.DataFrame()
+                    active_baseline = pd.concat([baseline, fallback], ignore_index=True)
+                anomalies = detect_anomalies(chunk, active_baseline)
+                if not anomalies.empty:
+                    if len(anomaly_samples) < 10000:
+                        anomaly_samples.append(anomalies.head(10000 - len(anomaly_samples)))
+                    generated = generate_alerts(evaluate_health_patterns(anomalies), anomalies)
+                    alerts.extend(generated)
+                    explanations.extend(explain_alert(a) for a in generated)
+                import_long_frame(chunk, f"New readings CSV '{nf.name}' chunk", source="csv_new")
 
-        if historical is not None:
-            import_long_frame(historical, f"Historical CSV '{hf.name}'", source="csv_historical")
-        if new is not None:
-            import_long_frame(new, f"New readings CSV '{nf.name}'", source="csv_new")
-
-        upload_hash = hashlib.sha256(raw_h + b"::ASTRAWELL::" + raw_n).hexdigest()
-        if register_import(upload_hash, hf.name if hf is not None else nf.name):
-            if historical is not None:
-                save_health_readings(historical)
-                save_baselines(calculate_baseline(historical))
-            if new is not None:
-                save_alerts(alerts)
-        reference_time = (str(new["timestamp"].max()) if new is not None
-                          else str(historical["timestamp"].max()))
-        created = ingest_alerts(alerts, "csv_import", "UNKNOWN", reference_time)
+        if baseline is None:
+            baseline = provisional_baseline(new_ids)
+        combined_hash = hashlib.sha256(hash_h + b"::ASTRAWELL::" + hash_n).hexdigest()
+        register_import(combined_hash, hf.name if hf is not None else nf.name)
+        if alerts:
+            reference_time = max(str(a.get("timestamp", "")) for a in alerts)
+            ingest_alerts(alerts, "csv_import", "UNKNOWN", reference_time or now_ts())
+            save_alerts(alerts[:1000])
         log_event("ANALYSIS", "—",
-                  f"CSV analysis complete ({baseline_source}): {len(alerts)} alert(s), {created} new")
+                  f"Chunked CSV analysis complete ({baseline_source}): {len(alerts)} alert(s)")
+        sample_frames = anomaly_samples or historical_sample
+        readings_preview = pd.concat(sample_frames, ignore_index=True) if sample_frames else pd.DataFrame()
+        anomaly_frame = pd.concat(anomaly_samples, ignore_index=True) if anomaly_samples else pd.DataFrame()
         return {"baseline": baseline, "baseline_source": baseline_source,
-                "anomalies": anomalies, "alerts": alerts, "explanations": expl,
-                "readings": new if new is not None else historical}, []
+                "anomalies": anomaly_frame, "alerts": alerts,
+                "explanations": explanations[:200], "readings": readings_preview}, []
     except Exception as exc:
         return None, [str(exc)]
 
@@ -862,6 +933,34 @@ with st.sidebar:
     interval = st.slider("Telemetry sampling interval (seconds)", 1, 30, int(ing.interval),
                          help="At 1 second, one fresh reading is generated per monitored astronaut every second.")
     ing.interval = float(interval)
+    st.divider()
+    st.markdown("### CSV REPLAY")
+    replay = st.session_state.get("csv_replay")
+    if st.button("PREPARE / RESET CSV REPLAY", key="prepare_csv_replay"):
+        st.session_state["csv_replay"] = create_csv_replay(
+            st.session_state.get("csv_replay_speed", 1.0)
+        )
+        replay = st.session_state["csv_replay"]
+    replay_speed = st.selectbox("CSV playback speed", [1, 2, 5, 10, 60], index=0,
+                                format_func=lambda x: f"{x}x", key="csv_replay_speed")
+    if replay is not None:
+        replay.set_speed(replay_speed)
+        rc1, rc2 = st.columns(2)
+        rc1.button("▶ PLAY / RESUME", key="csv_replay_start", on_click=replay.resume)
+        rc2.button("Ⅱ PAUSE", key="csv_replay_pause", on_click=replay.pause)
+        rc3, rc4 = st.columns(2)
+        rc3.button("■ STOP", key="csv_replay_stop", on_click=replay.stop)
+        rc4.button("↺ RESET", key="csv_replay_reset", on_click=replay.reset)
+        @st.fragment(run_every="1s")
+        def _render_replay_status(controller):
+            st.caption(f"Replay: {controller.status} · {controller.index:,}/{len(controller.timestamps):,} timestamps")
+            st.progress(controller.progress)
+            if controller.current_timestamp:
+                st.caption(f"Source timestamp: {controller.current_timestamp} UTC")
+            if controller.last_error:
+                st.error(controller.last_error)
+        _render_replay_status(replay)
+
     st.divider()
     st.markdown("### VIEW")
     source_key = SOURCES[st.selectbox("Data source", list(SOURCES), index=2, help="Simulated and CSV data stay separate by default. Choose All sources only when you intentionally want to combine them.")]

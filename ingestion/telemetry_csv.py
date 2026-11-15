@@ -49,3 +49,49 @@ def prepare_telemetry_csv(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(pieces, ignore_index=True)[
         ["astronaut_id", "timestamp", "indicator", "value", "unit", "source"]
     ]
+
+VALIDATION_RULES = {
+    "heart_rate": ("bpm", 1.0, 250.0),
+    "spo2": ("percent", 0.0, 100.0),
+    "temperature": ("C", 25.0, 45.0),
+    "sleep_duration": ("hours", 0.0, 24.0),
+    "fatigue": ("score", 1.0, 5.0),
+}
+
+
+def validate_telemetry_chunk(frame: pd.DataFrame, label: str = "CSV") -> pd.DataFrame:
+    """Vectorized strict validation suitable for large chunked imports."""
+    data = frame.copy()
+    required = ["astronaut_id", "timestamp", "indicator", "value", "unit", "source"]
+    missing = [column for column in required if column not in data.columns]
+    if missing:
+        raise ValueError(f"{label}: missing required columns: {missing}")
+    for column in ("astronaut_id", "indicator", "unit", "source"):
+        data[column] = data[column].astype("string").str.strip()
+    data["indicator"] = data["indicator"].str.lower()
+    data["source"] = data["source"].str.lower()
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True, errors="coerce")
+    data["value"] = pd.to_numeric(data["value"], errors="coerce")
+    missing_mask = data[required].isna().any(axis=1)
+    if missing_mask.any():
+        raise ValueError(f"{label}: {int(missing_mask.sum())} rows have missing IDs, timestamps, indicators, units, sources, or numeric values.")
+    if data["astronaut_id"].str.len().eq(0).any():
+        raise ValueError(f"{label}: astronaut_id cannot be empty.")
+    unknown = sorted(set(data["indicator"]) - set(VALIDATION_RULES))
+    if unknown:
+        raise ValueError(f"{label}: unsupported indicators: {unknown}")
+    for indicator, (unit, minimum, maximum) in VALIDATION_RULES.items():
+        mask = data["indicator"].eq(indicator)
+        if not mask.any():
+            continue
+        wrong_unit = mask & data["unit"].ne(unit)
+        if wrong_unit.any():
+            raise ValueError(f"{label}: {indicator} requires unit '{unit}'.")
+        out_of_range = mask & ~data["value"].between(minimum, maximum)
+        if out_of_range.any():
+            bad = data.loc[out_of_range, "value"].iloc[0]
+            raise ValueError(f"{label}: {indicator} value {bad} is outside {minimum}–{maximum}.")
+    duplicates = data.duplicated(["astronaut_id", "timestamp", "indicator"])
+    if duplicates.any():
+        raise ValueError(f"{label}: {int(duplicates.sum())} duplicate astronaut/timestamp/indicator rows.")
+    return data.reset_index(drop=True)
