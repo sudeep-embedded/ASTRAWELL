@@ -51,9 +51,12 @@ INDICATORS = {
     "fatigue": ("FATIGUE", "/5", 0, 0.5),
 }
 Z_FLAG, Z_WARN = 2.5, 1.5
-RANGES = {"1 hour": timedelta(hours=1), "6 hours": timedelta(hours=6),
-          "24 hours": timedelta(hours=24), "7 days": timedelta(days=7),
-          "30 days": timedelta(days=30)}
+RANGES = {"1 minute": timedelta(minutes=1), "5 minutes": timedelta(minutes=5),
+          "15 minutes": timedelta(minutes=15), "1 hour": timedelta(hours=1),
+          "6 hours": timedelta(hours=6), "24 hours": timedelta(hours=24),
+          "7 days": timedelta(days=7), "30 days": timedelta(days=30)}
+LIVE_RANGES = {"1 minute": timedelta(minutes=1), "5 minutes": timedelta(minutes=5),
+               "15 minutes": timedelta(minutes=15), "1 hour": timedelta(hours=1)}
 SOURCES = {"All sources": "all", "Simulated": "simulated", "CSV import": "csv_import"}
 # Thirty deterministic synthetic crew profiles. Values are illustrative baselines,
 # not measurements or medically validated limits.
@@ -290,7 +293,7 @@ class Ingestor:
     """Single process-wide writer thread shared by every browser session."""
 
     def __init__(self, source: TelemetrySource):
-        self.source, self.interval, self.running = source, 3.0, False
+        self.source, self.interval, self.running = source, 1.0, False
         self.monitor_mode, self.target_astronaut = "Crew (all astronauts)", None
         self.ticks, self.baselines, self.last_error = 0, {}, ""
         if source.name == "simulated":
@@ -316,8 +319,22 @@ class Ingestor:
 
     def start(self):
         if not self.running:
+            # A new live run is a clean session: preserve CSV imports, clear only
+            # simulated-session telemetry/alerts and cached baselines.
+            if self.source.name == "simulated":
+                with transaction() as conn:
+                    conn.execute("DELETE FROM telemetry WHERE source='simulated'")
+                    conn.execute("DELETE FROM live_alerts WHERE source='simulated'")
+                    _event(conn, "IMPORT", "SYSTEM", "Previous simulated session cleared; fresh session initialized")
+                self.baselines.clear()
+                self.ticks = 0
+                for aid in CREW:
+                    self.source.s[aid].update(dev=0.0, ep=0, len=1, sleep=PROFILE[aid][3])
+                list_astronauts.clear()
+                total_readings.clear()
+                baseline_stats.clear()
             self.running = True
-            log_event("TELEMETRY", "SYSTEM", f"Monitoring started ({self.source.name})")
+            log_event("TELEMETRY", "SYSTEM", f"Fresh monitoring session started ({self.source.name})")
 
     def stop(self):
         if self.running:
@@ -651,7 +668,7 @@ def mission_view(aid: str, source: str, range_label: str):
     # ---- D. telemetry charts
     st.markdown(f'<div class="sec">REAL-TIME TELEMETRY — {html.escape(aid)} — {range_label.upper()} '
                 f'(ending at latest reading)</div>', unsafe_allow_html=True)
-    d = load_window(aid, source, RANGES[range_label])
+    d = load_window(aid, source, LIVE_RANGES.get(range_label, RANGES[range_label]))
     stats = baseline_stats(aid, source)
     if d.empty:
         st.info("No readings for this selection.")
@@ -767,7 +784,8 @@ with st.sidebar:
     b1, b2 = st.columns(2)
     b1.button("▶ START", on_click=ing.start, disabled=ing.running)
     b2.button("■ STOP", on_click=ing.stop, disabled=not ing.running)
-    interval = st.slider("Refresh interval (s)", 1, 30, int(ing.interval))
+    interval = st.slider("Telemetry sampling interval (seconds)", 1, 30, int(ing.interval),
+                         help="At 1 second, one fresh reading is generated per monitored astronaut every second.")
     ing.interval = float(interval)
     st.divider()
     st.markdown("### VIEW")
@@ -780,7 +798,7 @@ with st.sidebar:
     sel = st.selectbox("Astronaut", ids) if ids else None
     ing.monitor_mode = monitor_mode
     ing.target_astronaut = sel if monitor_mode == "Individual astronaut" else None
-    range_label = st.select_slider("Time range", list(RANGES), value="24 hours")
+    range_label = st.select_slider("Live monitoring window", list(LIVE_RANGES), value="5 minutes")
     st.divider()
     st.markdown("### DATA INPUT")
     hist_file = st.file_uploader("Historical baseline CSV", type=["csv"], key="historical")
