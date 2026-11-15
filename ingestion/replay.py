@@ -70,7 +70,6 @@ class ReplayController:
             self._wake.set()
 
     def _run(self):
-        previous = None
         while True:
             self._wake.wait()
             self._wake.clear()
@@ -81,6 +80,7 @@ class ReplayController:
                             self.status = "COMPLETED"
                         break
                     timestamp = self.timestamps[self.index]
+                    previous = self.timestamps[self.index - 1] if self.index > 0 else None
                     speed = self.speed
                 if previous is not None:
                     try:
@@ -102,7 +102,6 @@ class ReplayController:
                     with self._lock:
                         self.current_timestamp = timestamp
                         self.index += 1
-                        previous = timestamp
                 except Exception as exc:
                     with self._lock:
                         self.last_error = f"{type(exc).__name__}: {exc}"
